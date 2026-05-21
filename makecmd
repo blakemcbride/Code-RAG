@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+
+./bld jar
+cp src/main/java/Test.java .
+javac -cp work/Kiss.jar Test.java
+
+cp libs/postgresql-42.2.12.jar .
+cp work/Kiss.jar .

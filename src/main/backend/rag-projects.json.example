@@ -1,0 +1,20 @@
+{
+  "_comment": "Edit this file to declare your projects. Each project becomes a PostgreSQL schema (in the claude_rag database) and is exposed at /rag-mcp/<name> for Claude Code. Restart the server after editing so the schema is bootstrapped.",
+
+  "projects": [
+    {
+      "name": "demo",
+      "roots": [
+        "/path/to/your/code"
+      ],
+      "excludeGlobs": [
+        "**/node_modules", "**/node_modules/**",
+        "**/.git", "**/.git/**",
+        "**/build", "**/build/**",
+        "**/target", "**/target/**",
+        "**/dist", "**/dist/**",
+        "**/*.jar"
+      ]
+    }
+  ]
+}

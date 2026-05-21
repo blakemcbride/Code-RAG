@@ -1,0 +1,183 @@
+frontend.war
+build.work
+work
+builder/builder/*.class
+apache-tomcat-*
+tomcat
+libs/c3p0-*.jar
+libs/groovy-*.jar
+libs/javax.servlet-api-*.jar
+libs/log4j-*.jar
+libs/mchange-commons-java-*.jar
+libs/mssql-*.jar
+libs/mysql-*.jar
+libs/ojdbc*.jar
+libs/postgresql-*.jar
+libs/slf4j-*.jar
+libs/sqlite-jdbc-*.jar
+libs/fontbox-*.jar
+libs/pdfbox-*.jar
+libs/junit-*.jar
+libs/apiguardian*.jar
+libs/jakarta.*.jar
+libs/metadata-extractor-*.jar
+libs/xmpcore-*.jar
+book
+
+
+# Gradle
+# ------
+.gradle
+/buildSrc/build
+/buildSrc/subprojects/*/build
+/subprojects/*/build
+/subprojects/docs/src/samples/*/*/build
+/subprojects/internal-android-performance-testing/build-android-libs
+
+# IDEA
+# ----
+#     User-specific stuff
+.idea
+.idea/**/workspace.xml
+.idea/**/tasks.xml
+.idea/**/dictionaries
+.idea/**/shelf
+#     Sensitive or high-churn files
+.idea/**/dataSources/
+.idea/**/dataSources.ids
+.idea/**/dataSources.local.xml
+.idea/**/sqlDataSources.xml
+.idea/**/dynamic.xml
+.idea/**/uiDesigner.xml
+.idea/**/dbnavigator.xml
+#     Gradle
+.idea/**/gradle.xml
+.idea/**/libraries
+.shelf
+/*.iml
+/*.ipr
+/*.iws
+/buildSrc/.idea
+/buildSrc/.shelf
+/buildSrc/*.iml
+/buildSrc/*.ipr
+/buildSrc/*.iws
+/buildSrc/out
+/buildSrc/subprojects/*/*.iml
+/buildSrc/subprojects/*/out
+/out
+/subprojects/*/*.iml
+/subprojects/*/out
+/.teamcity/*.iml
+/.teamcity/target
+
+# Eclipse
+# -------
+*.classpath
+*.project
+*.settings
+/bin
+/subprojects/*/bin
+atlassian-ide-plugin.xml
+.metadata/
+
+# NetBeans
+# --------
+.nb-gradle
+.nb-gradle-properties
+
+# Vim
+# ---
+*.sw[op]
+
+# Emacs
+# -----
+*~
+\#*\#
+.\#*
+*.bak
+
+.vscode
+
+# Textmate
+# --------
+.textmate
+
+# Sublime Text
+# ------------
+*.sublime-*
+
+# jEnv
+# ----
+.java-version
+
+# macOS
+# ----
+.DS_Store
+
+# HPROF
+# -----
+*.hprof
+
+# Work dirs
+# ---------
+/incoming-distributions
+/intTestHomeDir
+
+# Logs
+# ----
+/*.log
+
+# oh-my-zsh gradle plugin
+.gradletasknamecache
+
+# TeXInfo stuff
+/manual/*.aux
+/manual/*.cp
+/manual/*.dvi
+/manual/*.fn
+/manual/*.fns
+/manual/*.ky
+/manual/*.log
+/manual/*.pg
+/manual/*.toc
+/manual/*.tp
+/manual/*.vr
+/manual/Kiss.pdf
+/manual/GroovyOverview.pdf
+
+/nbproject/private/
+/dist/
+
+src/main/frontend/lib/jquery*
+
+/build/
+manual/asciidoc/
+
+# ----- Claude-RAG -----
+# Real (secret-bearing) config files — only the *.example files are tracked.
+src/main/backend/application.ini
+src/main/backend/rag-projects.json
+
+# Tomcat data and build artifacts
+/tomcat/
+/target/
+node_modules/
+.gradle-home/
+
+# Local editor / agent artifacts
+.codex
+.codex/
+.claude
+.claude/
+
+# Stray junk that crept into the working tree during development
+*.save
+/Test.java
+/Test.groovy
+/test.ini
+/codex.md
+/Announcement*.txt
+/Groovy.txt
+src/main/backend/FixPhoneNumbers.groovy
+src/main/backend/DB.sqlite.save

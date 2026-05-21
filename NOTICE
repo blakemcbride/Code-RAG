@@ -1,0 +1,14 @@
+Claude-RAG
+Copyright (c) 2026 Blake McBride and contributors
+
+This product includes software developed at the Kiss Web Development
+Framework project (https://kissweb.org). The Kiss code under
+src/main/core/ and src/main/frontend/kiss/ is licensed under the
+Apache License, Version 2.0 and is unchanged here unless noted.
+
+This product uses, but does not redistribute:
+  - PostgreSQL (postgresql.org) with the pgvector extension
+  - Ollama (ollama.com) and the model checkpoints it serves
+  - The Anthropic Claude API via the Claude Code CLI
+
+See LICENSE.txt for the full Apache 2.0 license text.

@@ -1,0 +1,53 @@
+; ----------------------------------------------------------------------
+; application.ini.example — TEMPLATE
+;
+; setup.sh copies this to application.ini and replaces REPLACE_WITH_RANDOM_UUID
+; with a fresh secret. Edit your real application.ini for any further changes;
+; the .example file is what ships in the repo.
+; ----------------------------------------------------------------------
+
+[main]
+
+; ----- Database (PostgreSQL with pgvector) -----
+DatabaseType = PostgreSQL
+DatabaseHost = localhost
+DatabasePort = 5432
+DatabaseName = claude_rag
+DatabaseUser = postgres
+DatabasePassword = ""
+
+; Required: pgvector statement cache must be disabled (race with bulk indexer)
+DatabaseMaxStatements = 0
+DatabaseMaxStatementsPerConnection = 0
+; Required: 0 disables c3p0's forced reclaim of long-held connections.
+; Kiss's default of 60s would abort multi-minute reindex jobs.
+DatabaseUnreturnedTimeout = 0
+
+; Standard Kiss knobs
+MaxWorkerThreads = 30
+UserInactiveSeconds = 900
+
+; ----- Ollama embedding service -----
+OllamaURL              = http://127.0.0.1:11434
+EmbeddingModel         = nomic-embed-text:v1.5
+EmbeddingDim           = 768
+EmbeddingBatch         = 32
+EmbeddingMaxBatchBytes = 6000
+
+; ----- Retrieval -----
+; pgvector HNSW search depth — higher = better recall, mild query-time cost.
+; 400 is comfortable up to ~100k chunks; bump to 800 if recall starts to slip.
+HNSWEfSearch = 400
+
+; ----- Indexer -----
+; Project roots and exclude globs are per-project in rag-projects.json.
+; These are global indexer knobs.
+RAGSweepMinutes  = 10
+RAGMaxFileBytes  = 1048576
+RAGCommitBatch   = 50
+
+; ----- MCP authentication -----
+; setup.sh fills this in with a random UUID. Treat it as a password — anyone
+; with this value can call the MCP server. Rotate by editing application.ini
+; and restarting; also update the --header on the corresponding `claude mcp add`.
+RAGMCPSharedSecret = REPLACE_WITH_RANDOM_UUID
