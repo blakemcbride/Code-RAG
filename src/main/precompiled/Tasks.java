@@ -649,63 +649,323 @@ public class Tasks {
             printlnIfSet(cfg, "EmbeddingModel", "    embedding model:  ");
         }
 
-        java.util.List<String> names = readProjectNames("src/main/backend/rag-projects.json");
-        if (!names.isEmpty()) {
+        // Per-project block with roots + each client's MCP entry wiring.
+        //   ✓ wired   — project exists AND a matching MCP entry exists
+        //   ⚠ no MCP  — project exists but no MCP entry targets it
+        //   (orphan)  — MCP entry targets this server but the project name
+        //               isn't in rag-projects.json
+        java.util.LinkedHashMap<String, java.util.List<String>> projects =
+                readProjects("src/main/backend/rag-projects.json");
+        java.io.File claudeCfg = new java.io.File(System.getProperty("user.home"), ".claude.json");
+        java.io.File codexCfg  = new java.io.File(System.getProperty("user.home"), ".codex/config.toml");
+        java.util.List<ClientEntry> claudeAll = readClaudeCodeEntries(claudeCfg);
+        java.util.List<ClientEntry> codexAll  = readCodexEntries(codexCfg);
+
+        // Partition each client's entries:
+        //   matching  = current-port AND urlProject is in rag-projects.json
+        //               (drawn under the project's block, with cwd check)
+        //   stranded  = current-port but project not configured, OR any
+        //               entry whose port differs from this server's HTTP port,
+        //               OR an entry with no project segment in the URL
+        //               (shown in the "stale / orphan" section)
+        java.util.Map<String, java.util.List<ClientEntry>> claudeMatched =
+                bucketByProject(claudeAll, httpP, projects.keySet());
+        java.util.Map<String, java.util.List<ClientEntry>> codexMatched =
+                bucketByProject(codexAll, httpP, projects.keySet());
+        java.util.List<ClientEntry> claudeStranded = strandedEntries(claudeAll, httpP, projects.keySet());
+        java.util.List<ClientEntry> codexStranded  = strandedEntries(codexAll, httpP, projects.keySet());
+
+        println("");
+        if (claudeCfg.exists())
+            println("  Claude Code config: " + claudeCfg.getAbsolutePath());
+        if (codexCfg.exists())
+            println("  Codex config:       " + codexCfg.getAbsolutePath());
+        if (!claudeCfg.exists() && !codexCfg.exists())
+            println("  Client configs:     neither ~/.claude.json nor ~/.codex/config.toml found");
+        if (claudeCfg.exists()) {
             println("");
-            println("  Projects (" + names.size() + "):");
-            for (String n : names) println("    " + n);
+            println("  Note: each Claude Code MCP entry is keyed by the directory it was");
+            println("  registered from. The entry is only visible to Claude Code sessions");
+            println("  launched from that exact directory. The 'registered under …' lines");
+            println("  below state that directory for every entry — compare against the");
+            println("  directory you actually start 'claude' in.");
         }
 
-        // Claude Code config — show the path and any MCP entries
-        // referencing this installation (matched by our HTTP port URL).
-        java.io.File ccCfg = new java.io.File(System.getProperty("user.home"), ".claude.json");
-        println("");
-        println("  Claude Code config: " + ccCfg.getAbsolutePath()
-                + (ccCfg.exists() ? "" : "   (not found)"));
-        java.util.List<String> ccEntries = readClaudeCodeEntries(ccCfg, httpP);
-        if (!ccEntries.isEmpty()) {
-            println("    MCP entries pointing here:");
-            for (String e : ccEntries) println("      " + e);
-        } else if (ccCfg.exists()) {
-            println("    (no MCP entries point at http://127.0.0.1:" + httpP + "/rag-mcp/)");
+        if (!projects.isEmpty()) {
+            println("");
+            println("  Projects (rag-projects.json):");
+            for (java.util.Map.Entry<String, java.util.List<String>> p : projects.entrySet()) {
+                String name = p.getKey();
+                java.util.List<String> roots = p.getValue();
+                println("");
+                println("    " + name);
+                if (roots.isEmpty()) {
+                    println("      roots:        (none configured)");
+                } else if (roots.size() == 1) {
+                    println("      roots:        " + roots.get(0));
+                } else {
+                    println("      roots:        " + roots.get(0));
+                    for (int i = 1; i < roots.size(); i++)
+                        println("                    " + roots.get(i));
+                }
+                if (claudeCfg.exists())
+                    printWiringLines("Claude Code", claudeMatched.get(name), true);
+                if (codexCfg.exists())
+                    printWiringLines("Codex", codexMatched.get(name), false);
+            }
+        }
+
+        if (!claudeStranded.isEmpty() || !codexStranded.isEmpty()) {
+            println("");
+            println("  Stale / orphan MCP entries (URL is rag-mcp but does not match a current project on this server):");
+            for (ClientEntry e : claudeStranded)
+                printStrandedLines("Claude Code", e, httpP, true);
+            for (ClientEntry e : codexStranded)
+                printStrandedLines("Codex", e, httpP, false);
         }
         println("");
     }
 
     /**
-     * Scan a Claude Code config file for MCP server entries whose URL points
-     * at this installation (i.e. the http port we just determined). Returns
-     * a list of <code>name → url</code> strings, one per matching entry.
-     * Best-effort: assumes the format <code>claude mcp add</code> produces.
+     * Print indented lines for each MCP entry under a project. For Claude
+     * Code entries the registration directory is always shown so a stale
+     * registration (one keyed to the wrong cwd) is visible without having
+     * to read claude.json by hand.
      */
-    private static java.util.List<String> readClaudeCodeEntries(java.io.File ccCfg, String ourHttpPort) {
-        java.util.List<String> out = new java.util.ArrayList<>();
+    private static void printWiringLines(String clientLabel,
+                                         java.util.List<ClientEntry> entries,
+                                         boolean cwdScoped) {
+        if (entries == null || entries.isEmpty()) {
+            println(String.format("      %-13s (no MCP entry)", clientLabel + ":"));
+            return;
+        }
+        for (ClientEntry e : entries) {
+            println(String.format("      %-13s '%s'", clientLabel + ":", e.name));
+            println("                    " + visibilityNote(e, cwdScoped));
+        }
+    }
+
+    /** Multi-line block in the stranded section: entry + URL + visibility + reason. */
+    private static void printStrandedLines(String clientLabel, ClientEntry e,
+                                           String currentPort, boolean cwdScoped) {
+        println(String.format("    %-12s '%s' → %s", clientLabel + ":", e.name, e.urlString()));
+        println("                 " + visibilityNote(e, cwdScoped));
+        StringBuilder why = new StringBuilder();
+        if (!currentPort.equals(e.urlPort)) why.append("stale port ").append(e.urlPort).append("; ");
+        if (e.urlProject.isEmpty()) why.append("no project segment in URL; ");
+        else if (currentPort.equals(e.urlPort)) why.append("project '").append(e.urlProject)
+                                                      .append("' not in rag-projects.json; ");
+        if (why.length() == 0) why.append("orphan");
+        println("                 ⚠ " + why.toString().replaceFirst("; $", ""));
+    }
+
+    /** "registered under …" / "user scope" / "global" — never judges, just states. */
+    private static String visibilityNote(ClientEntry e, boolean cwdScoped) {
+        if (!cwdScoped)
+            return "(global — visible to any Codex session)";
+        if (e.registeredUnder == null)
+            return "(user scope — visible from any directory)";
+        return "registered under " + e.registeredUnder
+                + "   (only visible when 'claude' is launched from there)";
+    }
+
+    /** Partition: entries on the current port whose urlProject is in {@code knownProjects}. */
+    private static java.util.Map<String, java.util.List<ClientEntry>> bucketByProject(
+            java.util.List<ClientEntry> entries, String currentPort,
+            java.util.Set<String> knownProjects) {
+        java.util.LinkedHashMap<String, java.util.List<ClientEntry>> out = new java.util.LinkedHashMap<>();
+        for (ClientEntry e : entries) {
+            if (!currentPort.equals(e.urlPort)) continue;
+            if (e.urlProject.isEmpty()) continue;
+            if (!knownProjects.contains(e.urlProject)) continue;
+            out.computeIfAbsent(e.urlProject, k -> new java.util.ArrayList<>()).add(e);
+        }
+        return out;
+    }
+
+    /** Anything not in the bucketByProject result: stale port, wrong project, or no project at all. */
+    private static java.util.List<ClientEntry> strandedEntries(
+            java.util.List<ClientEntry> entries, String currentPort,
+            java.util.Set<String> knownProjects) {
+        java.util.List<ClientEntry> out = new java.util.ArrayList<>();
+        for (ClientEntry e : entries) {
+            boolean good = currentPort.equals(e.urlPort)
+                    && !e.urlProject.isEmpty()
+                    && knownProjects.contains(e.urlProject);
+            if (!good) out.add(e);
+        }
+        return out;
+    }
+
+    /**
+     * Parse rag-projects.json into a name-ordered map of project name → roots[].
+     * Best-effort regex parser (Tasks.java intentionally has no JSON dep) —
+     * tolerates excludeGlobs and other fields, expects the JSON shape that
+     * the .example template uses.
+     */
+    private static java.util.LinkedHashMap<String, java.util.List<String>> readProjects(String file) {
+        java.util.LinkedHashMap<String, java.util.List<String>> out = new java.util.LinkedHashMap<>();
+        java.nio.file.Path p = java.nio.file.Paths.get(file);
+        if (!java.nio.file.Files.exists(p)) return out;
+        try {
+            String content = new String(java.nio.file.Files.readAllBytes(p), java.nio.charset.StandardCharsets.UTF_8);
+            java.util.regex.Matcher nameMatcher =
+                    java.util.regex.Pattern.compile("\"name\"\\s*:\\s*\"([^\"]+)\"").matcher(content);
+            java.util.regex.Pattern rootsPat =
+                    java.util.regex.Pattern.compile("\"roots\"\\s*:\\s*\\[([^\\]]*)\\]");
+            java.util.regex.Pattern stringPat =
+                    java.util.regex.Pattern.compile("\"([^\"]+)\"");
+            // Collect name+offset for each project, then slice between them
+            // to find that project's roots array.
+            java.util.List<int[]> spans = new java.util.ArrayList<>();
+            java.util.List<String> names = new java.util.ArrayList<>();
+            while (nameMatcher.find()) {
+                spans.add(new int[]{nameMatcher.start(), nameMatcher.end()});
+                names.add(nameMatcher.group(1));
+            }
+            for (int i = 0; i < names.size(); i++) {
+                int sliceStart = spans.get(i)[1];
+                int sliceEnd = (i + 1 < spans.size()) ? spans.get(i + 1)[0] : content.length();
+                String slice = content.substring(sliceStart, sliceEnd);
+                java.util.regex.Matcher rm = rootsPat.matcher(slice);
+                java.util.List<String> roots = new java.util.ArrayList<>();
+                if (rm.find()) {
+                    java.util.regex.Matcher sm = stringPat.matcher(rm.group(1));
+                    while (sm.find()) roots.add(sm.group(1));
+                }
+                out.put(names.get(i), roots);
+            }
+        } catch (java.io.IOException ignored) {}
+        return out;
+    }
+
+    /**
+     * A single MCP entry found in a client's config.
+     * <ul>
+     *   <li>{@link #name} — the key in claude.json or the TOML section name in Codex.</li>
+     *   <li>{@link #registeredUnder} — the absolute working-directory path the
+     *       entry is registered under (claude.json default <code>--scope local</code>).
+     *       {@code null} for entries not cwd-keyed (Claude Code user-scope, or Codex).</li>
+     *   <li>{@link #urlPort} — the port in the entry's URL. If this differs
+     *       from the server's current HTTP port the entry is stale.</li>
+     *   <li>{@link #urlProject} — the project segment from the URL path
+     *       (<code>…/rag-mcp/&lt;project&gt;</code>). May be empty if the URL has no
+     *       project segment.</li>
+     * </ul>
+     */
+    static class ClientEntry {
+        final String name;
+        final String registeredUnder;
+        final String urlPort;
+        final String urlProject;
+        ClientEntry(String name, String registeredUnder, String urlPort, String urlProject) {
+            this.name = name;
+            this.registeredUnder = registeredUnder;
+            this.urlPort = urlPort;
+            this.urlProject = urlProject == null ? "" : urlProject;
+        }
+        String urlString() {
+            return "http://127.0.0.1:" + urlPort + "/rag-mcp"
+                    + (urlProject.isEmpty() ? "" : "/" + urlProject);
+        }
+    }
+
+    /**
+     * Scan a Claude Code config file for MCP server entries whose URL targets
+     * any port at <code>http://127.0.0.1:&lt;port&gt;/rag-mcp[/&lt;project&gt;]</code>.
+     * Returns the full list — caller filters by current-port-and-known-project
+     * vs. stale/orphan. Each entry records its registered-under cwd key
+     * (null = user-scope) plus port and url-path-project.
+     */
+    private static java.util.List<ClientEntry> readClaudeCodeEntries(java.io.File ccCfg) {
+        java.util.List<ClientEntry> out = new java.util.ArrayList<>();
         if (!ccCfg.exists()) return out;
         try {
             String content = new String(java.nio.file.Files.readAllBytes(ccCfg.toPath()),
                                         java.nio.charset.StandardCharsets.UTF_8);
-            // For each URL referencing our port, walk backwards to the most
-            // recent "<name>": { ... before it — that's the entry name.
-            String urlPrefix = "\"url\":";
-            String hostMarker = "http://127.0.0.1:" + ourHttpPort + "/rag-mcp/";
-            java.util.regex.Pattern namePat = java.util.regex.Pattern.compile("\"([a-zA-Z0-9_.-]+)\"\\s*:\\s*\\{");
-            int idx = 0;
-            java.util.LinkedHashSet<String> seen = new java.util.LinkedHashSet<>();
-            while (true) {
-                int hit = content.indexOf(hostMarker, idx);
-                if (hit < 0) break;
-                String before = content.substring(0, hit);
-                java.util.regex.Matcher m = namePat.matcher(before);
+            // Match any rag-mcp URL regardless of port, with optional project segment.
+            java.util.regex.Pattern urlPat = java.util.regex.Pattern.compile(
+                    "http://127\\.0\\.0\\.1:(\\d+)/rag-mcp(?:/([a-zA-Z0-9_.-]+))?");
+            java.util.regex.Pattern namePat =
+                    java.util.regex.Pattern.compile("\"([a-zA-Z0-9_.-]+)\"\\s*:\\s*\\{");
+            java.util.regex.Pattern pathKeyPat =
+                    java.util.regex.Pattern.compile("\"(/[^\"]+)\"\\s*:\\s*\\{");
+            java.util.regex.Matcher um = urlPat.matcher(content);
+            while (um.find()) {
+                String port = um.group(1);
+                String project = um.group(2); // may be null
+                int hit = um.start();
+                String beforeUrl = content.substring(0, hit);
+                // Most recent `"<name>": {` is the entry name.
+                java.util.regex.Matcher m = namePat.matcher(beforeUrl);
                 String lastName = null;
                 while (m.find()) lastName = m.group(1);
-                int urlEnd = content.indexOf('"', hit + hostMarker.length());
-                String url = urlEnd > hit ? content.substring(hit, urlEnd) : "http://127.0.0.1:" + ourHttpPort + "/rag-mcp/?";
-                if (lastName != null) seen.add(lastName + "  →  " + url);
-                idx = hit + hostMarker.length();
+                if (lastName == null) continue;
+                // Most recent `"mcpServers"` before that defines scope.
+                int mcpServersPos = beforeUrl.lastIndexOf("\"mcpServers\"");
+                String regUnder = null;
+                if (mcpServersPos > 0) {
+                    String beforeMcp = beforeUrl.substring(0, mcpServersPos);
+                    java.util.regex.Matcher pm = pathKeyPat.matcher(beforeMcp);
+                    while (pm.find()) regUnder = pm.group(1);
+                }
+                out.add(new ClientEntry(lastName, regUnder, port, project));
             }
-            out.addAll(seen);
         } catch (java.io.IOException ignored) {}
         return out;
+    }
+
+    /**
+     * Scan a Codex CLI <code>config.toml</code> for {@code [mcp_servers.&lt;name&gt;]}
+     * sections whose {@code url = "…"} targets any port at
+     * <code>http://127.0.0.1:&lt;port&gt;/rag-mcp[/&lt;project&gt;]</code>. Returns a flat list
+     * (caller filters); the {@code registeredUnder} field is always null
+     * because Codex's config is not cwd-keyed.
+     */
+    private static java.util.List<ClientEntry> readCodexEntries(java.io.File toml) {
+        java.util.List<ClientEntry> out = new java.util.ArrayList<>();
+        if (!toml.exists()) return out;
+        try {
+            String content = new String(java.nio.file.Files.readAllBytes(toml.toPath()),
+                                        java.nio.charset.StandardCharsets.UTF_8);
+            java.util.regex.Pattern headerPat =
+                    java.util.regex.Pattern.compile("(?m)^\\s*\\[([^\\]]+)\\]");
+            java.util.regex.Pattern urlPat =
+                    java.util.regex.Pattern.compile("(?m)^\\s*url\\s*=\\s*\"([^\"]+)\"");
+            java.util.regex.Pattern ragMcpPat = java.util.regex.Pattern.compile(
+                    "http://127\\.0\\.0\\.1:(\\d+)/rag-mcp(?:/([a-zA-Z0-9_.-]+))?");
+            java.util.regex.Matcher m = headerPat.matcher(content);
+            String prevSection = null;
+            int prevEnd = 0;
+            while (m.find()) {
+                if (prevSection != null)
+                    captureCodexSection(prevSection, content.substring(prevEnd, m.start()),
+                                        urlPat, ragMcpPat, out);
+                prevSection = m.group(1).trim();
+                prevEnd = m.end();
+            }
+            if (prevSection != null)
+                captureCodexSection(prevSection, content.substring(prevEnd),
+                                    urlPat, ragMcpPat, out);
+        } catch (java.io.IOException ignored) {}
+        return out;
+    }
+
+    private static void captureCodexSection(String section, String body,
+                                            java.util.regex.Pattern urlPat,
+                                            java.util.regex.Pattern ragMcpPat,
+                                            java.util.List<ClientEntry> out) {
+        if (!section.startsWith("mcp_servers."))
+            return;
+        String entryName = section.substring("mcp_servers.".length());
+        java.util.regex.Matcher u = urlPat.matcher(body);
+        if (!u.find())
+            return;
+        String url = u.group(1);
+        java.util.regex.Matcher rm = ragMcpPat.matcher(url);
+        if (!rm.find())
+            return;
+        out.add(new ClientEntry(entryName, null, rm.group(1), rm.group(2)));
     }
 
     /** Extract group 1 of the first match of {@code regex} in {@code file}, or {@code fallback}. */

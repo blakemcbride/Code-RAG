@@ -13,6 +13,79 @@ use** — start the server the same way, maintain the same
 The only difference is on the *client* side: how each agent learns
 about the MCP server.
 
+## Two config files involved
+
+Working with Code-RAG through Claude Code touches two distinct config
+files, owned by opposite sides of the system. The most common point of
+confusion is mixing up their roles, so:
+
+| File | What it does | Who edits it | When you touch it |
+|---|---|---|---|
+| `src/main/backend/rag-projects.json` | Tells the Code-RAG **server** which code trees to index. One JSON entry per project: `name`, absolute `roots[]`, optional `excludeGlobs`. Gitignored — the committed `.example` is just a template. | You (hand-edit). | When adding/removing a project or changing its roots. Restart Kiss after editing so the new schema gets bootstrapped. |
+| `~/.claude.json` | Tells **Claude Code** which MCP servers exist for which working directory. Holds your *entire* Claude Code state (every project's settings + MCP entries), not just Code-RAG. | The `claude` CLI (`claude mcp add` / `remove` / `list`). Don't hand-edit unless you have to. | When registering this Code-RAG instance with a new Claude Code project, or when the shared secret rotates. |
+
+The two files don't communicate directly. The **bridge is the URL**: in
+`~/.claude.json` you add an MCP entry with URL
+`http://127.0.0.1:17080/rag-mcp/<X>`, and `<X>` must equal a `name` in
+`rag-projects.json`. If they don't match the server replies 404 when
+Claude Code tries to call a tool.
+
+Worth being precise about one subtlety: the MCP **entry name** in
+`~/.claude.json` (the key under `mcpServers`) is just Claude Code's
+local label — it becomes the `mcp__<name>__…` tool prefix Claude Code
+exposes. The server, on the other hand, routes on the URL **path
+segment** after `/rag-mcp/`. We use the same string for both by
+convention — usually the `name` from `rag-projects.json` — so all three
+agree, but they are technically independent variables. The thing the
+server actually requires to match is the URL path segment.
+
+`rag-projects.json` is documented end-to-end in [Setup.md §3](Setup.md)
+and [Running.md §4](Running.md). `~/.claude.json` is Claude Code's own
+file — its schema and behavior live with [Claude Code's
+documentation](https://docs.claude.com/en/docs/claude-code/overview).
+
+## Working directory and visible MCP entries
+
+Claude Code identifies its "current project" by **the absolute working
+directory `claude` was launched from**. There is no separate project
+flag — `pwd` *is* the identity. Inside `~/.claude.json` your MCP entries
+live under that path as a key:
+
+```text
+projects:
+    /home/you/Stack360/Code-RAG:
+        mcpServers:
+            myproj:
+                url:     "http://127.0.0.1:17080/rag-mcp/myproj"
+                headers: { "X-RAG-Token": "..." }
+    /home/you/somewhere-else:
+        mcpServers: { ... }
+```
+
+The default `--scope local` (which is what plain `claude mcp add` uses)
+writes the entry under the cwd you ran the command in. Practical
+consequences:
+
+- **Register from the directory you'll launch `claude` from.** Running
+  `claude mcp add` from `/home/you/Stack360/Code-RAG` puts the entry
+  under that key; launching `claude` from somewhere else will not show
+  the `myproj` server.
+- **`claude mcp list` is cwd-sensitive.** A blank list usually means
+  you registered from a different directory.
+- **Renaming or moving the working tree invalidates the entry.** The
+  old project key no longer matches your new cwd. Re-run
+  `claude mcp add` from the new path (or edit the key in
+  `~/.claude.json` by hand).
+- **`--scope user` makes an entry visible from any directory.** Useful
+  if you want a single Code-RAG registration that works no matter
+  where you launch `claude`. The trade-off: every Claude Code session
+  on the machine sees that MCP entry, whether the project is relevant
+  to the work or not.
+- **`--scope project` writes a committable `.mcp.json` inside the
+  project tree.** Visible from anywhere inside that tree. We don't
+  recommend it for Code-RAG because the shared secret would end up in
+  the file (and possibly in git).
+
 ## 0. Prerequisites
 
 - Code-RAG is installed and the server is running on its default

@@ -1,13 +1,15 @@
 
 @AI/KnowledgeBase.md
 
+@AI/ApplicationDetails.md
+
 Claude should never change this file.
 
 ## HUMAN NOTES (To be ignored by Claude)
 
 Claude: ignore everything in this section
 
-If you are building an application, you will want to put all of your 
-application-specific notes in AI/ApplicationDetails.md and then instruct
-Claude to read it.
+KnowledgeBase.md is the Kiss-framework reference (don't touch).
+ApplicationDetails.md is where this project's specifics live —
+edit that, not this file.
 

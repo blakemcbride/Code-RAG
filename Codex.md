@@ -15,6 +15,68 @@ with `./bld scan`. The only difference here is on the *client* side:
 where Claude Code registers an MCP server via `claude mcp add`, Codex
 registers one via an entry in `~/.codex/config.toml`.
 
+## Two config files involved
+
+Working with Code-RAG through Codex CLI touches two distinct config
+files, owned by opposite sides of the system. The most common point of
+confusion is mixing up their roles, so:
+
+| File | What it does | Who edits it | When you touch it |
+|---|---|---|---|
+| `src/main/backend/rag-projects.json` | Tells the Code-RAG **server** which code trees to index. One JSON entry per project: `name`, absolute `roots[]`, optional `excludeGlobs`. Gitignored — the committed `.example` is just a template. | You (hand-edit). | When adding/removing a project or changing its roots. Restart Kiss after editing so the new schema gets bootstrapped. |
+| `~/.codex/config.toml` | Tells **Codex CLI** which MCP servers exist. Holds Codex's general configuration plus a `[mcp_servers.*]` section per server. A `.codex/config.toml` inside a trusted project directory provides per-project scoping. | You (hand-edit TOML). | When registering this Code-RAG instance with Codex, or when the shared secret rotates. |
+
+The two files don't communicate directly. The **bridge is the URL**: in
+`~/.codex/config.toml` you set
+`url = "http://127.0.0.1:17080/rag-mcp/<X>"`, and `<X>` must equal a
+`name` in `rag-projects.json`. If they don't match the server replies
+404 when Codex tries to call a tool.
+
+Worth being precise about one subtlety: the TOML section name
+(`[mcp_servers.<name>]`) is just Codex's local label for the server.
+The server, on the other hand, routes on the URL **path segment** after
+`/rag-mcp/`. We use the same string for both by convention — usually the
+`name` from `rag-projects.json` — so all three agree, but they are
+technically independent variables. The thing the server actually
+requires to match is the URL path segment.
+
+`rag-projects.json` is documented end-to-end in [Setup.md §3](Setup.md)
+and [Running.md §4](Running.md). `~/.codex/config.toml` is Codex's own
+file — its schema and behavior live with [Codex's MCP
+reference](https://developers.openai.com/codex/mcp).
+
+## Working directory and visible MCP entries
+
+Codex reads MCP config from up to two places at startup:
+
+1. **`~/.codex/config.toml`** — global. Loaded regardless of the
+   directory you launch `codex` from.
+2. **`.codex/config.toml`** inside a *trusted* project directory —
+   per-project overrides and additions, loaded only when `codex` is
+   started inside that tree and Codex has been told the project is
+   trusted.
+
+Unlike Claude Code — which keys its default-scope MCP entries by the
+absolute working directory — Codex's global entries are visible
+everywhere by default. Practical consequences:
+
+- **A single `[mcp_servers.myproj]` in `~/.codex/config.toml` works
+  from any cwd.** You don't have to re-register from every project
+  directory.
+- **Renaming or moving the Code-RAG working tree does NOT invalidate
+  the entry**, because the entry isn't keyed by cwd. The only thing
+  the entry references is the loopback URL (`http://127.0.0.1:17080/…`)
+  and the project name in the URL path.
+- **If you want an entry that only applies inside one checkout**, put
+  a `[mcp_servers.<name>]` block in that checkout's
+  `.codex/config.toml` and mark the project trusted. See [Codex's
+  advanced-configuration
+  docs](https://developers.openai.com/codex/config-advanced) for the
+  trust mechanism.
+- **Multiple Code-RAG projects** can coexist as separate global
+  entries — pick a different TOML section name and URL path segment
+  per project; both are independent of the cwd.
+
 ## 0. Prerequisites
 
 - Code-RAG is installed and the server is running on its default
