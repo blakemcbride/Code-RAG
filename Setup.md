@@ -182,16 +182,8 @@ with:
 ***** SERVER IS RUNNING *****
 ```
 
-Wait for the HTTP endpoint to be live (a few seconds):
-
-```bash
-until curl -sf -o /dev/null --max-time 3 -X POST http://localhost:17080/rest \
-    -H 'Content-Type: application/json' \
-    -d '{"_method":"listProjects","_class":"services/RAGAdmin"}'; do
-  sleep 1
-done
-echo "ready"
-```
+`./bld status` will confirm `Status: RUNNING` with `HTTP port: 17080
+(listening)` once the endpoint is up.
 
 Verify the project's schema was bootstrapped:
 

@@ -72,17 +72,12 @@ psql -U postgres -d code_rag -c 'CREATE EXTENSION IF NOT EXISTS vector;'
 # 5. Pull the embedding model (one-time).
 ollama pull nomic-embed-text:v1.5
 
-# 6. Start the server.
+# 6. Start the server. The first time a project's index is empty Kiss
+#    will auto-scan it on startup in a background thread; you can watch
+#    progress with `./bld scan <project>` or `./bld status`.
 ./bld -v start
 
-# 7. Trigger the first full index of your project (replace "myproj" with
-# the name you used in rag-projects.json).
-SECRET=$(grep '^RAGMCPSharedSecret' src/main/backend/application.ini | sed 's/.*=\s*//' | tr -d ' ')
-curl -s -X POST http://localhost:17080/rest \
-    -H 'Content-Type: application/json' \
-    -d '{"_method":"reindex","_class":"services/RAGAdmin","project":"myproj","full":true}'
-
-# 8. Register the MCP server with your agent (one entry per project).
+# 7. Register the MCP server with your agent (one entry per project).
 #    Pick the guide for the client you use:
 #      Claude Code        → ClaudeCode.md
 #      OpenAI Codex CLI   → Codex.md

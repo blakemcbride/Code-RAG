@@ -54,19 +54,8 @@ cd /path/to/code-rag
 ```
 
 You should see `***** SERVER IS RUNNING *****`. The server listens on
-`http://127.0.0.1:17080`.
-
-Wait for the HTTP endpoint to be live (occasionally takes a few seconds
-after "running"):
-
-```bash
-until curl -sf -o /dev/null --max-time 3 -X POST http://localhost:17080/rest \
-    -H 'Content-Type: application/json' \
-    -d '{"_method":"listProjects","_class":"services/RAGAdmin"}'; do
-  sleep 1
-done
-echo "ready"
-```
+`http://127.0.0.1:17080`. Run `./bld status` to confirm the HTTP port
+is listening and to see the per-project file/chunk counts.
 
 If Tomcat refuses to start with a `tomcat/bin/debug: cd: ...: No such file or directory`
 error, that's a stale debug script from a different working directory.
@@ -82,14 +71,13 @@ rm -f tomcat/bin/debug tomcat/bin/stopdebug
 ## 2. Quick health check
 
 ```bash
-curl -s -X POST http://localhost:17080/rest \
-    -H 'Content-Type: application/json' \
-    -d '{"_method":"listProjects","_class":"services/RAGAdmin"}' | python3 -m json.tool
+./bld status
 ```
 
-Should print every configured project plus current file/chunk counts. Empty
-projects show `files: 0, chunks: 0` — that means the schema exists but you
-have not run the first index yet.
+Reports `Status: RUNNING` or `not running`, the live ports, database +
+Ollama config, and every configured project with its file/chunk counts.
+Empty projects show 0 files / 0 chunks — that means the schema exists
+but you haven't indexed it yet.
 
 ---
 
@@ -152,31 +140,23 @@ Rules:
 with the right tables, indexes, and seed `rag_meta` rows (idempotent — safe
 to run repeatedly).
 
-### 4c. Kick off the first full index
+### 4c. The first index
+
+You don't need to trigger it. The Kiss startup auto-scan (see §7.4) runs
+an incremental sweep on any project whose `rag_file` is empty right
+after `./bld start`, in a background thread. To watch it complete:
 
 ```bash
-curl -s -X POST http://localhost:17080/rest \
-    -H 'Content-Type: application/json' \
-    -d '{"_method":"reindex","_class":"services/RAGAdmin","project":"myproj","full":true}' \
-  | python3 -m json.tool
-# Expect: { ..., "started": true, ... }
+./bld scan myproj
 ```
 
-Watch progress:
+`scan` reports `rejected: A reindex is already in progress...` while
+the auto-scan is still running; once it finishes the next `./bld scan
+myproj` triggers a quick incremental top-up and prints per-poll
+progress until done.
 
-```bash
-while [ "$(psql -U postgres -d code_rag -tAc \
-    "SELECT value FROM myproj.rag_meta WHERE key='reindex_running'")" = "true" ]; do
-  psql -U postgres -d code_rag -tAc \
-    "SELECT 'files=' || (SELECT count(*) FROM myproj.rag_file) || \
-            ', chunks=' || (SELECT count(*) FROM myproj.rag_chunk)"
-  sleep 10
-done
-echo "indexing done"
-```
-
-Throughput is roughly 5–15 files/sec on a modern GPU; a 10k-file codebase
-finishes in ~10–25 minutes.
+Throughput is roughly 5–15 files/sec on a modern GPU; a 10k-file
+codebase finishes in ~10–25 minutes for the very first index.
 
 ---
 
@@ -198,25 +178,15 @@ re-register the MCP entry in whichever client(s) you use.
 
 ## 6. Day-to-day operations
 
-### Check status of one project
+### Check status
 
 ```bash
-curl -s -X POST http://localhost:17080/rest \
-    -H 'Content-Type: application/json' \
-    -d '{"_method":"status","_class":"services/RAGAdmin","project":"myproj"}' \
-  | python3 -m json.tool
+./bld status
 ```
 
-Returns counts, last-sweep stats, and `indexing: true|false`.
-
-### Check status of all projects at once
-
-```bash
-curl -s -X POST http://localhost:17080/rest \
-    -H 'Content-Type: application/json' \
-    -d '{"_method":"status","_class":"services/RAGAdmin"}' \
-  | python3 -m json.tool
-```
+Reports whether the server is running, the live ports, database and
+Ollama config, and every configured project with its file/chunk counts
+and last-sweep stats.
 
 ### Trigger a manual reindex
 
@@ -242,17 +212,10 @@ If a sweep is already running for that project the second caller is
 rejected by the per-project lock and reports `rejected: A reindex is
 already in progress...`.
 
-You can also drive `RAGAdmin.reindex` directly over JSON-RPC if you need
-a full rebuild (TRUNCATE + re-embed) or you want fire-and-forget
-behavior:
+For a **full rebuild** (TRUNCATE + re-embed everything — slow), `./bld
+scan` doesn't expose `full=true`, so call `RAGAdmin.reindex` directly:
 
 ```bash
-# Incremental — same effect as './bld scan myproj' but async (returns immediately):
-curl -s -X POST http://localhost:17080/rest \
-    -H 'Content-Type: application/json' \
-    -d '{"_method":"reindex","_class":"services/RAGAdmin","project":"myproj","full":false}'
-
-# Full rebuild (TRUNCATE + re-embed everything):
 curl -s -X POST http://localhost:17080/rest \
     -H 'Content-Type: application/json' \
     -d '{"_method":"reindex","_class":"services/RAGAdmin","project":"myproj","full":true}'
