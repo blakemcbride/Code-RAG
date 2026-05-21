@@ -98,6 +98,8 @@ output at each one), see [Setup.md](Setup.md).
 - [Setup.md](Setup.md) — step-by-step install + configuration from scratch.
 - [Running.md](Running.md) — operating instructions: start/stop, adding a
   project, daily commands, troubleshooting.
+- [Codex.md](Codex.md) — registering Claude-RAG with OpenAI Codex CLI in
+  addition to (or instead of) Claude Code.
 - [RAGPlan.md](RAGPlan.md) — the original single-project design doc.
 
 ## License
