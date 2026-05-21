@@ -55,9 +55,9 @@ public class Tasks {
      * command line so multiple Kiss instances can run side by side
      * without colliding.
      * <ul>
-     *   <li><code>-dp PORT</code> / <code>--debug-port=PORT</code>     — JDWP debug (default 9000)</li>
+     *   <li><code>-dp PORT</code> / <code>--debug-port=PORT</code>     — JDWP debug (default 17900)</li>
      *   <li><code>-hp PORT</code> / <code>--http-port=PORT</code>      — Tomcat HTTP (default 17080)</li>
-     *   <li><code>-sp PORT</code> / <code>--shutdown-port=PORT</code>  — Tomcat shutdown signal (default 8005)</li>
+     *   <li><code>-sp PORT</code> / <code>--shutdown-port=PORT</code>  — Tomcat shutdown signal (default 17005)</li>
      * </ul>
      * The HTTP and shutdown ports are written into
      * <code>tomcat/conf/server.xml</code> on every {@link #setupTomcat()};
@@ -65,9 +65,9 @@ public class Tasks {
      * re-applied on every <code>bld</code> invocation, so you can pick
      * different values per run with no manual cleanup.
      */
-    static String debugPort    = "9000";
+    static String debugPort    = "17900";
     static String httpPort     = "17080";
-    static String shutdownPort = "8005";
+    static String shutdownPort = "17005";
 
     /**
      * Main entry point for the build system.  It tells the build system what arguments were passed in
@@ -87,9 +87,9 @@ public class Tasks {
      * the corresponding static fields, and return the remaining arguments
      * for normal task dispatch. Recognized flags (any position):
      * <pre>
-     *   -dp PORT, --debug-port=PORT      JDWP   (default 9000)
+     *   -dp PORT, --debug-port=PORT      JDWP   (default 17900)
      *   -hp PORT, --http-port=PORT       HTTP   (default 17080)
-     *   -sp PORT, --shutdown-port=PORT   Tomcat shutdown signal (default 8005)
+     *   -sp PORT, --shutdown-port=PORT   Tomcat shutdown signal (default 17005)
      * </pre>
      * Non-numeric or out-of-range values are reported on stderr; the
      * default is kept in that case.
@@ -165,6 +165,7 @@ public class Tasks {
         println("");
         println("start                    build and run backend in the background");
         println("stop                     stop the background backend");
+        println("status                   report whether the system is running and its config");
         println("build                    build the entire system but don't run it");
         println("war                      create deployable war file");
 
@@ -183,9 +184,9 @@ public class Tasks {
         println("unit-tests               build the system for unit testing (KissUnitTest.jar)");
         println("");
         println("Options (any position):");
-        println("  -dp PORT, --debug-port=PORT       JDWP debug port (default 9000)");
+        println("  -dp PORT, --debug-port=PORT       JDWP debug port (default 17900)");
         println("  -hp PORT, --http-port=PORT        Tomcat HTTP port (default 17080)");
-        println("  -sp PORT, --shutdown-port=PORT    Tomcat shutdown port (default 8005)");
+        println("  -sp PORT, --shutdown-port=PORT    Tomcat shutdown port (default 17005)");
         println("");
     }
 
@@ -422,6 +423,218 @@ public class Tasks {
             runWait(true, "tomcat\\bin\\stopdebug.cmd");
         else
             runWait(true, "tomcat/bin/shutdown.sh");
+    }
+
+    /**
+     * Report whether the embedded Tomcat is running and summarize the
+     * live deployment: ports actually configured in
+     * <code>tomcat/conf/server.xml</code> and <code>tomcat/bin/debug</code>,
+     * database connection details from <code>application.ini</code>, and
+     * the project list from <code>rag-projects.json</code>. Reads from the
+     * running config files (not the in-process defaults), so the values
+     * reflect what's actually deployed rather than what the next
+     * invocation would use.
+     */
+    public static void status() {
+        String httpP = extractFromFile("tomcat/conf/server.xml",
+                "<Connector port=\"(\\d+)\" protocol=\"HTTP/1\\.1\"", httpPort);
+        String shutP = extractFromFile("tomcat/conf/server.xml",
+                "<Server port=\"(\\d+)\"", shutdownPort);
+        String dbgP  = extractFromFile("tomcat/bin/debug",
+                "JPDA_ADDRESS=(\\d+)", debugPort);
+
+        // Identify *this* application's JVM by its absolute catalina.base path,
+        // not by any JVM that happens to be running Catalina. This avoids
+        // confusing two Kiss installations (e.g. one for development and one
+        // for a derived app) when both are running.
+        java.util.Optional<ProcessHandle> jvm = findKissJvm();
+        boolean up = jvm.isPresent();
+
+        println("");
+        println("  Status:            " + (up ? "RUNNING" : "not running"));
+        if (up) {
+            ProcessHandle h = jvm.get();
+            println("  PID:               " + h.pid());
+            h.info().startInstant().ifPresent(start -> {
+                long sec = java.time.Duration.between(start, java.time.Instant.now()).getSeconds();
+                println("  Uptime:            " + humanDuration(sec));
+            });
+        } else {
+            int httpInt = parseIntOr(httpP, 0);
+            if (httpInt > 0 && portListening("127.0.0.1", httpInt))
+                println("  Note: TCP port " + httpP + " is bound, but not by this installation.");
+        }
+        println("");
+        println("  HTTP port:         " + httpP + (up ? "  (listening)" : ""));
+        println("  Shutdown port:     " + shutP);
+        println("  Debug port (JDWP): " + dbgP);
+
+        java.util.Map<String, String> cfg = readIni("src/main/backend/application.ini");
+        if (!cfg.isEmpty()) {
+            println("");
+            println("  Database:");
+            printlnIfSet(cfg, "DatabaseType",   "    type:             ");
+            printlnIfSet(cfg, "DatabaseHost",   "    host:             ");
+            printlnIfSet(cfg, "DatabasePort",   "    port:             ");
+            printlnIfSet(cfg, "DatabaseName",   "    name:             ");
+            printlnIfSet(cfg, "DatabaseUser",   "    user:             ");
+            println("");
+            println("  Ollama:");
+            printlnIfSet(cfg, "OllamaURL",      "    url:              ");
+            printlnIfSet(cfg, "EmbeddingModel", "    embedding model:  ");
+        }
+
+        java.util.List<String> names = readProjectNames("src/main/backend/rag-projects.json");
+        if (!names.isEmpty()) {
+            println("");
+            println("  Projects (" + names.size() + "):");
+            for (String n : names) println("    " + n);
+        }
+
+        // Claude Code config — show the path and any MCP entries
+        // referencing this installation (matched by our HTTP port URL).
+        java.io.File ccCfg = new java.io.File(System.getProperty("user.home"), ".claude.json");
+        println("");
+        println("  Claude Code config: " + ccCfg.getAbsolutePath()
+                + (ccCfg.exists() ? "" : "   (not found)"));
+        java.util.List<String> ccEntries = readClaudeCodeEntries(ccCfg, httpP);
+        if (!ccEntries.isEmpty()) {
+            println("    MCP entries pointing here:");
+            for (String e : ccEntries) println("      " + e);
+        } else if (ccCfg.exists()) {
+            println("    (no MCP entries point at http://127.0.0.1:" + httpP + "/rag-mcp/)");
+        }
+        println("");
+    }
+
+    /**
+     * Scan a Claude Code config file for MCP server entries whose URL points
+     * at this installation (i.e. the http port we just determined). Returns
+     * a list of <code>name → url</code> strings, one per matching entry.
+     * Best-effort: assumes the format <code>claude mcp add</code> produces.
+     */
+    private static java.util.List<String> readClaudeCodeEntries(java.io.File ccCfg, String ourHttpPort) {
+        java.util.List<String> out = new java.util.ArrayList<>();
+        if (!ccCfg.exists()) return out;
+        try {
+            String content = new String(java.nio.file.Files.readAllBytes(ccCfg.toPath()),
+                                        java.nio.charset.StandardCharsets.UTF_8);
+            // For each URL referencing our port, walk backwards to the most
+            // recent "<name>": { ... before it — that's the entry name.
+            String urlPrefix = "\"url\":";
+            String hostMarker = "http://127.0.0.1:" + ourHttpPort + "/rag-mcp/";
+            java.util.regex.Pattern namePat = java.util.regex.Pattern.compile("\"([a-zA-Z0-9_.-]+)\"\\s*:\\s*\\{");
+            int idx = 0;
+            java.util.LinkedHashSet<String> seen = new java.util.LinkedHashSet<>();
+            while (true) {
+                int hit = content.indexOf(hostMarker, idx);
+                if (hit < 0) break;
+                String before = content.substring(0, hit);
+                java.util.regex.Matcher m = namePat.matcher(before);
+                String lastName = null;
+                while (m.find()) lastName = m.group(1);
+                int urlEnd = content.indexOf('"', hit + hostMarker.length());
+                String url = urlEnd > hit ? content.substring(hit, urlEnd) : "http://127.0.0.1:" + ourHttpPort + "/rag-mcp/?";
+                if (lastName != null) seen.add(lastName + "  →  " + url);
+                idx = hit + hostMarker.length();
+            }
+            out.addAll(seen);
+        } catch (java.io.IOException ignored) {}
+        return out;
+    }
+
+    /** Extract group 1 of the first match of {@code regex} in {@code file}, or {@code fallback}. */
+    private static String extractFromFile(String file, String regex, String fallback) {
+        java.nio.file.Path p = java.nio.file.Paths.get(file);
+        if (!java.nio.file.Files.exists(p)) return fallback;
+        try {
+            String content = new String(java.nio.file.Files.readAllBytes(p), java.nio.charset.StandardCharsets.UTF_8);
+            java.util.regex.Matcher m = java.util.regex.Pattern.compile(regex).matcher(content);
+            return m.find() ? m.group(1) : fallback;
+        } catch (java.io.IOException e) {
+            return fallback;
+        }
+    }
+
+    /** Open a TCP socket to host:port with a short timeout; true if reachable. */
+    private static boolean portListening(String host, int port) {
+        if (port <= 0) return false;
+        try (java.net.Socket s = new java.net.Socket()) {
+            s.connect(new java.net.InetSocketAddress(host, port), 250);
+            return true;
+        } catch (java.io.IOException e) {
+            return false;
+        }
+    }
+
+    private static int parseIntOr(String s, int fallback) {
+        try { return Integer.parseInt(s.trim()); } catch (NumberFormatException e) { return fallback; }
+    }
+
+    /**
+     * Find the JVM belonging to <em>this</em> Kiss installation by matching
+     * its <code>-Dcatalina.base=&lt;abs-path-to-our-tomcat&gt;</code>
+     * argument. Multiple Kiss instances on the same host therefore stay
+     * disambiguated.
+     */
+    private static java.util.Optional<ProcessHandle> findKissJvm() {
+        String ourCatalinaBase;
+        try {
+            ourCatalinaBase = new java.io.File("tomcat").getCanonicalPath();
+        } catch (java.io.IOException e) {
+            ourCatalinaBase = new java.io.File("tomcat").getAbsolutePath();
+        }
+        String needle = "-Dcatalina.base=" + ourCatalinaBase;
+        return ProcessHandle.allProcesses()
+                .filter(ph -> ph.info().commandLine()
+                        .map(c -> c.contains(needle))
+                        .orElse(false))
+                .findFirst();
+    }
+
+    /** Format a duration in seconds as e.g. "2d 3h", "5h 12m", "45s". */
+    private static String humanDuration(long seconds) {
+        long d = seconds / 86400, h = (seconds % 86400) / 3600, m = (seconds % 3600) / 60, s = seconds % 60;
+        if (d > 0) return d + "d " + h + "h";
+        if (h > 0) return h + "h " + m + "m";
+        if (m > 0) return m + "m " + s + "s";
+        return s + "s";
+    }
+
+    /** Parse a simple key=value ini file (no sections). Lines starting with # or ; are comments. */
+    private static java.util.Map<String, String> readIni(String file) {
+        java.util.LinkedHashMap<String, String> out = new java.util.LinkedHashMap<>();
+        java.nio.file.Path p = java.nio.file.Paths.get(file);
+        if (!java.nio.file.Files.exists(p)) return out;
+        try {
+            for (String line : java.nio.file.Files.readAllLines(p, java.nio.charset.StandardCharsets.UTF_8)) {
+                String t = line.trim();
+                if (t.isEmpty() || t.startsWith("#") || t.startsWith(";")) continue;
+                int eq = t.indexOf('=');
+                if (eq < 0) continue;
+                out.put(t.substring(0, eq).trim(), t.substring(eq + 1).trim());
+            }
+        } catch (java.io.IOException ignored) {}
+        return out;
+    }
+
+    private static void printlnIfSet(java.util.Map<String, String> cfg, String key, String prefix) {
+        String v = cfg.get(key);
+        if (v != null && !v.isEmpty())
+            println(prefix + v);
+    }
+
+    /** Extract every {@code "name": "..."} value from a JSON file. */
+    private static java.util.List<String> readProjectNames(String file) {
+        java.util.List<String> names = new java.util.ArrayList<>();
+        java.nio.file.Path p = java.nio.file.Paths.get(file);
+        if (!java.nio.file.Files.exists(p)) return names;
+        try {
+            String content = new String(java.nio.file.Files.readAllBytes(p), java.nio.charset.StandardCharsets.UTF_8);
+            java.util.regex.Matcher m = java.util.regex.Pattern.compile("\"name\"\\s*:\\s*\"([^\"]+)\"").matcher(content);
+            while (m.find()) names.add(m.group(1));
+        } catch (java.io.IOException ignored) {}
+        return names;
     }
 
     /**
