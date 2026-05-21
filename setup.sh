@@ -65,7 +65,7 @@ cat <<'NEXT'
 Setup complete. Next steps:
   1. Edit src/main/backend/rag-projects.json to point at your real code roots.
   2. Make sure PostgreSQL (with pgvector) and Ollama are running. See Running.md.
-  3. Start the server:  ./bld -v start-backend
+  3. Start the server:  ./bld -v start
   4. Register the MCP server with Claude Code (see Running.md §5).
   5. The shared secret you need is in src/main/backend/application.ini under
      RAGMCPSharedSecret.

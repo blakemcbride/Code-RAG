@@ -68,18 +68,18 @@ psql -U postgres -d claude_rag -c 'CREATE EXTENSION IF NOT EXISTS vector;'
 ollama pull nomic-embed-text:v1.5
 
 # 6. Start the server.
-./bld -v start-backend
+./bld -v start
 
 # 7. Trigger the first full index of your project (replace "myproj" with
 # the name you used in rag-projects.json).
 SECRET=$(grep '^RAGMCPSharedSecret' src/main/backend/application.ini | sed 's/.*=\s*//' | tr -d ' ')
-curl -s -X POST http://localhost:8080/rest \
+curl -s -X POST http://localhost:17080/rest \
     -H 'Content-Type: application/json' \
     -d '{"_method":"reindex","_class":"services/RAGAdmin","project":"myproj","full":true}'
 
 # 8. Register with Claude Code (one MCP server per project).
 claude mcp add --transport http rag-myproj \
-    http://127.0.0.1:8080/rag-mcp/myproj \
+    http://127.0.0.1:17080/rag-mcp/myproj \
     --header "X-RAG-Token: $SECRET"
 ```
 

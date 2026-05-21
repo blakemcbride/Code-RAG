@@ -16,26 +16,8 @@ not. Check the first two, then start Kiss.
 
 ### 1a. PostgreSQL
 
-```bash
-# Verify it is running and accepting connections
-pg_isready -h localhost -p 5432
-# Expect: localhost:5432 - accepting connections
-```
-
-If it is not running:
-
-```bash
-sudo systemctl start postgresql
-sudo systemctl enable postgresql   # one-time, so it auto-starts on reboot
-```
-
-Quick sanity check that the RAG database is still there:
-
-```bash
-psql -U postgres -d claude_rag -tAc "SELECT schema_name FROM information_schema.schemata
-                                     WHERE schema_name NOT IN ('information_schema','pg_catalog','pg_toast','public');"
-# Should list every project schema you have configured.
-```
+Assumed to be up and accepting connections on `localhost:5432`. If it is
+not, start it before proceeding.
 
 ### 1b. Ollama
 
@@ -68,17 +50,17 @@ ollama list | grep nomic-embed-text
 
 ```bash
 cd /path/to/claude-rag
-./bld -v start-backend
+./bld -v start
 ```
 
 You should see `***** SERVER IS RUNNING *****`. The server listens on
-`http://127.0.0.1:8080`.
+`http://127.0.0.1:17080`.
 
 Wait for the HTTP endpoint to be live (occasionally takes a few seconds
 after "running"):
 
 ```bash
-until curl -sf -o /dev/null --max-time 3 -X POST http://localhost:8080/rest \
+until curl -sf -o /dev/null --max-time 3 -X POST http://localhost:17080/rest \
     -H 'Content-Type: application/json' \
     -d '{"_method":"listProjects","_class":"services/RAGAdmin"}'; do
   sleep 1
@@ -92,7 +74,7 @@ Delete it once; `bld` will regenerate it with the right path:
 
 ```bash
 rm -f tomcat/bin/debug tomcat/bin/stopdebug
-./bld -v start-backend
+./bld -v start
 ```
 
 ---
@@ -100,7 +82,7 @@ rm -f tomcat/bin/debug tomcat/bin/stopdebug
 ## 2. Quick health check
 
 ```bash
-curl -s -X POST http://localhost:8080/rest \
+curl -s -X POST http://localhost:17080/rest \
     -H 'Content-Type: application/json' \
     -d '{"_method":"listProjects","_class":"services/RAGAdmin"}' | python3 -m json.tool
 ```
@@ -153,8 +135,8 @@ Rules:
 ### 4b. Restart Kiss so the bootstrap creates the schema
 
 ```bash
-./bld stop-backend
-./bld -v start-backend
+./bld stop
+./bld -v start
 ```
 
 `KissInit.init2` runs at startup; it creates the new schema in `claude_rag`
@@ -164,7 +146,7 @@ to run repeatedly).
 ### 4c. Kick off the first full index
 
 ```bash
-curl -s -X POST http://localhost:8080/rest \
+curl -s -X POST http://localhost:17080/rest \
     -H 'Content-Type: application/json' \
     -d '{"_method":"reindex","_class":"services/RAGAdmin","project":"myproj","full":true}' \
   | python3 -m json.tool
@@ -200,7 +182,7 @@ Grab your secret from `application.ini` and pass it as a header:
 SECRET=$(grep '^RAGMCPSharedSecret' src/main/backend/application.ini | sed 's/.*=\s*//' | tr -d ' ')
 
 claude mcp add --transport http rag-myproj \
-    http://127.0.0.1:8080/rag-mcp/myproj \
+    http://127.0.0.1:17080/rag-mcp/myproj \
     --header "X-RAG-Token: $SECRET"
 ```
 
@@ -223,7 +205,7 @@ After registration:
 ### Check status of one project
 
 ```bash
-curl -s -X POST http://localhost:8080/rest \
+curl -s -X POST http://localhost:17080/rest \
     -H 'Content-Type: application/json' \
     -d '{"_method":"status","_class":"services/RAGAdmin","project":"myproj"}' \
   | python3 -m json.tool
@@ -234,7 +216,7 @@ Returns counts, last-sweep stats, and `indexing: true|false`.
 ### Check status of all projects at once
 
 ```bash
-curl -s -X POST http://localhost:8080/rest \
+curl -s -X POST http://localhost:17080/rest \
     -H 'Content-Type: application/json' \
     -d '{"_method":"status","_class":"services/RAGAdmin"}' \
   | python3 -m json.tool
@@ -244,12 +226,12 @@ curl -s -X POST http://localhost:8080/rest \
 
 ```bash
 # Incremental (changed/new files only — fast):
-curl -s -X POST http://localhost:8080/rest \
+curl -s -X POST http://localhost:17080/rest \
     -H 'Content-Type: application/json' \
     -d '{"_method":"reindex","_class":"services/RAGAdmin","project":"myproj","full":false}'
 
 # Full rebuild (TRUNCATE + re-embed everything):
-curl -s -X POST http://localhost:8080/rest \
+curl -s -X POST http://localhost:17080/rest \
     -H 'Content-Type: application/json' \
     -d '{"_method":"reindex","_class":"services/RAGAdmin","project":"myproj","full":true}'
 ```
@@ -278,8 +260,8 @@ grep ERROR tomcat/logs/catalina.out | tail -20
 ### Stop / restart Kiss
 
 ```bash
-./bld stop-backend     # stop
-./bld -v start-backend # start
+./bld stop     # stop
+./bld -v start # start
 ```
 
 A restart resets `reindex_running='false'` per project, so a crashed sweep
@@ -295,8 +277,8 @@ fully remove:
 
 ```bash
 # 1. Delete the entry from src/main/backend/rag-projects.json and restart:
-./bld stop-backend
-./bld -v start-backend
+./bld stop
+./bld -v start
 
 # 2. Drop the schema explicitly (irreversible):
 psql -U postgres -d claude_rag -c "DROP SCHEMA myproj CASCADE;"
@@ -309,7 +291,7 @@ claude mcp remove rag-myproj
 
 ## 8. Troubleshooting
 
-**Tomcat starts but `8080` is not listening.**
+**Tomcat starts but `17080` is not listening.**
 Look at the bottom of `tomcat/logs/catalina.out`. Most common: an exception
 during `KissInit.init2` (often because PostgreSQL is down or
 `rag-projects.json` has a bad project name). Fix the underlying issue and
@@ -347,7 +329,7 @@ retries each minute, so just fix the source and the next firing will succeed.
 
 **Claude Code does not see the `mcp__rag-*__*` tools.**
 - Verify the MCP server is registered: `claude mcp list`
-- Verify Kiss is up: `curl http://localhost:8080/rag-mcp/<project> -X POST -H "X-RAG-Token: <token>" -d '{"jsonrpc":"2.0","method":"tools/list","id":1}'`
+- Verify Kiss is up: `curl http://localhost:17080/rag-mcp/<project> -X POST -H "X-RAG-Token: <token>" -d '{"jsonrpc":"2.0","method":"tools/list","id":1}'`
 - Restart the Claude Code session (MCP servers are connected at session start).
 
 **Search results look noisy / miss obvious matches.**
@@ -371,8 +353,8 @@ continues. Look at the log line to see which file.
 | Database | `claude_rag` (PostgreSQL local) |
 | Per-project schema | `claude_rag.<project>.rag_file` / `rag_chunk` / `rag_meta` |
 | Embedding model | `nomic-embed-text:v1.5` (Ollama) |
-| Tomcat port | `8080` (localhost only) |
-| MCP URL | `http://127.0.0.1:8080/rag-mcp/<project>` |
+| Tomcat port | `17080` (localhost only) |
+| MCP URL | `http://127.0.0.1:17080/rag-mcp/<project>` |
 | MCP shared secret | `src/main/backend/application.ini` → `RAGMCPSharedSecret` |
 | Project config | `src/main/backend/rag-projects.json` |
 | Global knobs | `src/main/backend/application.ini` |

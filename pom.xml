@@ -301,10 +301,10 @@
           4) Replicate your old Ant tasks with maven-antrun-plugin.
              - "builder" runs at generate-sources to compile Tasks.java 
                and org/kissweb/BuildUtils.java.
-             - All other tasks ("start-backend", "stop-backend", etc.) 
+             - All other tasks ("start", "stop", etc.)
                are bound to <phase>none</phase>, so you explicitly run them with:
-                 mvn antrun:run@start-backend
-                 mvn antrun:run@stop-backend
+                 mvn antrun:run@start
+                 mvn antrun:run@stop
                  ... etc.
        -->
       <plugin>
@@ -339,9 +339,9 @@
             </configuration>
           </execution>
 
-          <!-- ========== start-backend ========== -->
+          <!-- ========== start ========== -->
           <execution>
-            <id>start-backend</id>
+            <id>start</id>
             <!-- set phase to 'none' so it doesn't auto-run -->
             <phase>none</phase>
             <goals>
@@ -357,15 +357,15 @@
                     <pathelement location="libs/commons-lang3-3.18.0.jar"/>
                   </classpath>
                   <!-- The second arg is the "target name." -->
-                  <arg value="start-backend"/>
+                  <arg value="start"/>
                 </java>
               </target>
             </configuration>
           </execution>
 
-          <!-- ========== stop-backend ========== -->
+          <!-- ========== stop ========== -->
           <execution>
-            <id>stop-backend</id>
+            <id>stop</id>
             <phase>none</phase>
             <goals>
               <goal>run</goal>
@@ -379,7 +379,7 @@
                     <pathelement location="libs/commons-io-2.16.1.jar"/>
                     <pathelement location="libs/commons-lang3-3.18.0.jar"/>
                   </classpath>
-                  <arg value="stop-backend"/>
+                  <arg value="stop"/>
                 </java>
               </target>
             </configuration>

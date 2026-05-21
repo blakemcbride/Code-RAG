@@ -170,7 +170,7 @@ the Claude Code side.
 ## 7. Build and start the server
 
 ```bash
-./bld -v start-backend
+./bld -v start
 ```
 
 The build downloads any missing JARs the first time. Expected output ends
@@ -183,7 +183,7 @@ with:
 Wait for the HTTP endpoint to be live (a few seconds):
 
 ```bash
-until curl -sf -o /dev/null --max-time 3 -X POST http://localhost:8080/rest \
+until curl -sf -o /dev/null --max-time 3 -X POST http://localhost:17080/rest \
     -H 'Content-Type: application/json' \
     -d '{"_method":"listProjects","_class":"services/RAGAdmin"}'; do
   sleep 1
@@ -207,7 +207,7 @@ Expected: one row per project listed in `rag-projects.json`.
 For each project name in `rag-projects.json`:
 
 ```bash
-curl -s -X POST http://localhost:8080/rest \
+curl -s -X POST http://localhost:17080/rest \
     -H 'Content-Type: application/json' \
     -d '{"_method":"reindex","_class":"services/RAGAdmin","project":"myproj","full":true}' \
   | python3 -m json.tool
@@ -249,7 +249,7 @@ Once per project:
 SECRET=$(grep '^RAGMCPSharedSecret' src/main/backend/application.ini | sed 's/.*=\s*//' | tr -d ' ')
 
 claude mcp add --transport http rag-myproj \
-    http://127.0.0.1:8080/rag-mcp/myproj \
+    http://127.0.0.1:17080/rag-mcp/myproj \
     --header "X-RAG-Token: $SECRET"
 ```
 
@@ -279,7 +279,7 @@ line ranges, then typically follow up with `Read` on the top hit's
 
 If you don't see the `mcp__rag-myproj__*` tools, check:
 
-1. The server is running: `curl http://localhost:8080/rag-mcp/myproj -X POST -H "X-RAG-Token: $SECRET" -d '{"jsonrpc":"2.0","method":"tools/list","id":1}'` returns JSON.
+1. The server is running: `curl http://localhost:17080/rag-mcp/myproj -X POST -H "X-RAG-Token: $SECRET" -d '{"jsonrpc":"2.0","method":"tools/list","id":1}'` returns JSON.
 2. The registration is visible: `claude mcp list`.
 3. You restarted the Claude Code session after registering (MCP servers
    connect at session start).

@@ -384,12 +384,12 @@ not in a JVM `AtomicBoolean`.
 
 Single-user, local-only.
 
-- Tomcat binds 8080 to `127.0.0.1` only (no LAN exposure).
+- Tomcat binds 17080 to `127.0.0.1` only (no LAN exposure).
 - Every MCP request must carry `X-RAG-Token` matching the shared secret
   in `application.ini`.
 - Admin endpoints at `/rest` are whitelisted in `KissInit.init` so they
   bypass Kiss's session auth. That's fine because Tomcat is loopback-
-  only; if you ever expose 8080 to the network, restore the session
+  only; if you ever expose 17080 to the network, restore the session
   check.
 - Project schema names are validated against `[a-z][a-z0-9_]*`. The
   same regex gates JSON-RPC `project` parameters and MCP URL path

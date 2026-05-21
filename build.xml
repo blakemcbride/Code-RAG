@@ -44,7 +44,7 @@
     </exec>
   </target>
 
-  <target name="start-backend" depends="builder">
+  <target name="start" depends="builder">
     <exec executable="${java.executable}">
       <arg value="-cp"/>
       <arg value="work/exploded/WEB-INF/classes:libs/commons-compress-1.27.1.jar:libs/commons-io-2.16.1.jar:libs/commons-lang3-3.18.0.jar"/>
@@ -53,7 +53,7 @@
     </exec>
   </target>
 
-  <target name="stop-backend" depends="builder">
+  <target name="stop" depends="builder">
     <exec executable="${java.executable}">
       <arg value="-cp"/>
       <arg value="work/exploded/WEB-INF/classes:libs/commons-compress-1.27.1.jar:libs/commons-io-2.16.1.jar:libs/commons-lang3-3.18.0.jar"/>

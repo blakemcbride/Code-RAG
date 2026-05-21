@@ -67,7 +67,7 @@ already using. Nothing leaves the host.
    per-file rollback on failure and a per-N-files commit (default 50).
 
 **Read path** (MCP server):
-1. Claude Code POSTs to `http://127.0.0.1:8080/rag-mcp/<project>` with an
+1. Claude Code POSTs to `http://127.0.0.1:17080/rag-mcp/<project>` with an
    MCP `tools/call` envelope (`X-RAG-Token` header for auth).
 2. The query string is embedded by Ollama using the same model used at
    index time.
@@ -144,7 +144,7 @@ WSL or manual translation of the bash scripts.
 
 - Local PostgreSQL connection (defaults to peer/trust against `postgres`).
 - Ability to `CREATE SCHEMA` and `CREATE EXTENSION vector` once at setup.
-- Network: only `localhost`. The Kiss server binds 8080 to localhost only.
+- Network: only `localhost`. The Kiss server binds 17080 to localhost only.
 
 ## Where things live
 

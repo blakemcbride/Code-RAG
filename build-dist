@@ -19,7 +19,7 @@ DIST="work/$NAME"
 # Ensure the app has been deployed to Tomcat
 if [ ! -d "tomcat/webapps/ROOT/WEB-INF" ]; then
     echo "Error: tomcat/webapps/ROOT not found."
-    echo "Run './bld start-backend' first (then stop it) to deploy the application."
+    echo "Run './bld start' first (then stop it) to deploy the application."
     exit 1
 fi
 
