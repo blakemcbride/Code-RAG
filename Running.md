@@ -328,12 +328,31 @@ sudo systemctl start postgresql
 journalctl -u postgresql -n 50    # see why if it refuses to start
 ```
 
-**Ollama unreachable.**
+**Ollama unreachable, or the embedding model isn't installed.**
+
+`./bld start` refuses to launch Tomcat in either case and prints which
+of the two it hit, with the exact remedy:
+
+```
+Cannot reach Ollama at http://127.0.0.1:11434: Connection refused
+Start Ollama (e.g. 'ollama serve' or via your service manager), then retry './bld start'.
+```
+
+or
+
+```
+Ollama is up at http://127.0.0.1:11434, but the configured embedding model
+'nomic-embed-text:v1.5' (application.ini → EmbeddingModel) is not installed.
+Install it with:
+    ollama pull nomic-embed-text:v1.5
+```
+
+To diagnose by hand:
 
 ```bash
-curl -v http://localhost:11434/api/tags
-# If "Connection refused": ollama is not running.
-ollama serve   # foreground
+curl -v http://localhost:11434/api/tags    # connection check
+ollama list | grep nomic-embed-text        # model check
+ollama serve                               # start ollama in the foreground
 ```
 
 **`indexing` is stuck at `true` forever.**

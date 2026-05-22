@@ -69,7 +69,7 @@ the user can port it upstream rather than carrying a local fork.
 ## bld commands
 
 ```
-./bld start                       # build + start Tomcat in the background
+./bld start                       # preflight Ollama (URL + embedding model), build, start Tomcat in background
 ./bld stop                        # graceful shutdown
 ./bld status                      # is it running? which ports? config? projects? MCP entries?
 ./bld scan <project|all>          # reconcile rag-projects.json with DB, then incremental sweep

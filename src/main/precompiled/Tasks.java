@@ -446,6 +446,8 @@ public class Tasks {
      * 5. run the local tomcat backend<br>
      */
     public static void start() {
+        if (!ollamaPreflightCheck())
+            return;
         buildSystem();
         setupTomcat();
         copyTree(BUILDDIR + "/exploded", "tomcat/webapps/ROOT");
@@ -457,6 +459,56 @@ public class Tasks {
         println("Server log can be viewed at " + cwd() + "/tomcat/logs/catalina.out or via the view-log command");
         println("The app can also be debugged at port " + debugPort);
         println("To stop the backend, type 'bld stop'");
+    }
+
+    /**
+     * Confirm Ollama is reachable AND the configured embedding model is
+     * installed, before bld start spends time building and launching
+     * Tomcat. Reads OllamaURL and EmbeddingModel from application.ini
+     * (with the same defaults the server uses). On any failure prints a
+     * specific, actionable error to stderr and returns false so the
+     * caller can abort.
+     */
+    private static boolean ollamaPreflightCheck() {
+        java.util.Map<String, String> cfg = readIni("src/main/backend/application.ini");
+        String url   = cfg.getOrDefault("OllamaURL", "http://127.0.0.1:11434");
+        String model = cfg.getOrDefault("EmbeddingModel", "nomic-embed-text:v1.5");
+        while (url.endsWith("/"))
+            url = url.substring(0, url.length() - 1);
+
+        String tagsUrl = url + "/api/tags";
+        String resp;
+        try {
+            java.net.HttpURLConnection conn = (java.net.HttpURLConnection) new java.net.URL(tagsUrl).openConnection();
+            conn.setRequestMethod("GET");
+            conn.setConnectTimeout(2000);
+            conn.setReadTimeout(5000);
+            int code = conn.getResponseCode();
+            if (code != 200) {
+                System.err.println("Ollama at " + url + " responded with HTTP " + code + " for " + tagsUrl + ".");
+                System.err.println("Verify Ollama is running and accepting requests on that URL.");
+                return false;
+            }
+            java.io.InputStream is = conn.getInputStream();
+            byte[] data = is == null ? new byte[0] : is.readAllBytes();
+            resp = new String(data, java.nio.charset.StandardCharsets.UTF_8);
+        } catch (java.io.IOException e) {
+            System.err.println("Cannot reach Ollama at " + url + ": " + e.getMessage());
+            System.err.println("Start Ollama (e.g. 'ollama serve' or via your service manager), then retry './bld start'.");
+            return false;
+        }
+
+        // /api/tags returns {"models":[{"name":"<m>","model":"<m>",...},...]}.
+        // The quoted model identifier is the safest substring check — it
+        // appears as a JSON string value in both the "name" and "model" fields.
+        if (!resp.contains("\"" + model + "\"")) {
+            System.err.println("Ollama is up at " + url + ", but the configured embedding model");
+            System.err.println("'" + model + "' (application.ini → EmbeddingModel) is not installed.");
+            System.err.println("Install it with:");
+            System.err.println("    ollama pull " + model);
+            return false;
+        }
+        return true;
     }
 
     /**

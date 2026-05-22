@@ -144,6 +144,10 @@ Expected: one line listing `nomic-embed-text:v1.5`.
 This is the default model the indexer and the MCP server both use.
 Changing it later means a full reindex; pick once and stick with it.
 
+`./bld start` preflight-checks this: it refuses to launch Tomcat if
+Ollama is unreachable or the configured `EmbeddingModel` is not
+installed, and prints the exact `ollama pull` command to run.
+
 ---
 
 ## 6. (Optional) Adjust global knobs
