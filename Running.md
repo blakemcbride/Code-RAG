@@ -33,9 +33,12 @@ If it is not running, start it:
 # Foreground (in its own terminal):
 ollama serve
 
-# OR, if installed as a systemd service:
+# Linux, as a systemd service:
 sudo systemctl start ollama
 sudo systemctl enable ollama       # one-time
+
+# macOS, as a Homebrew service:
+brew services start ollama         # current session + every boot
 ```
 
 Confirm the embedding model is present (the indexer will fail loudly if not):
@@ -350,8 +353,13 @@ restart.
 **`pg_isready` says no, but PostgreSQL is installed.**
 
 ```bash
+# Linux (systemd):
 sudo systemctl start postgresql
 journalctl -u postgresql -n 50    # see why if it refuses to start
+
+# macOS (Homebrew):
+brew services start postgresql@16   # match your installed version
+brew services info postgresql@16    # status + log path
 ```
 
 **Ollama unreachable, or the embedding model isn't installed.**

@@ -26,6 +26,59 @@ guide does not cover installing them.
 If any of those fail, fix them first; this guide assumes a clean slate
 otherwise.
 
+### Installing the prerequisites on macOS (Homebrew)
+
+Skip this subsection if your prerequisites are already in place. Apple
+Silicon and Intel both work — the only difference is whether Homebrew
+installs under `/opt/homebrew` (Apple Silicon) or `/usr/local`
+(Intel).
+
+```bash
+# PostgreSQL + pgvector
+brew install postgresql@16 pgvector
+brew services start postgresql@16
+
+# pgvector is shipped as a formula; it's installed into the running
+# postgres @16 automatically. No further action needed until step 4
+# (where we create the `vector` extension inside the new database).
+
+# Ollama
+brew install ollama
+brew services start ollama
+
+# Java 21 (Eclipse Temurin)
+brew install --cask temurin@21
+
+# Claude Code (optional, but needed if you want to drive Code-RAG from it)
+npm install -g @anthropic-ai/claude-code     # requires Node.js — `brew install node` first
+
+# Codex CLI (optional)
+npm install -g @openai/codex
+```
+
+`brew services start` is the macOS analogue of `systemctl start` —
+the rest of this guide uses `systemctl` syntax in its examples; on
+macOS substitute `brew services start <name>` / `brew services stop
+<name>`.
+
+Smoke-test that everything's reachable before moving on:
+
+```bash
+psql -U postgres -c 'SELECT 1'                         # PostgreSQL
+psql -U postgres -c "SELECT * FROM pg_available_extensions WHERE name='vector'"   # pgvector available
+curl -s http://localhost:11434/api/tags                # Ollama
+java -version                                          # Java 21+
+```
+
+> **PostgreSQL user note (macOS):** Homebrew's PostgreSQL doesn't
+> create a `postgres` superuser by default — it uses your macOS
+> username. If `psql -U postgres` errors with "role does not exist",
+> either create the role (`createuser -s postgres`) or substitute
+> your own username in every `psql -U postgres` invocation in this
+> guide. The Code-RAG server reads the username from
+> `application.ini` (`DatabaseUser`), so it doesn't care which one
+> you pick — just be consistent.
+
 ---
 
 ## 1. Get the code
