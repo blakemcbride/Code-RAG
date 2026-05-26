@@ -147,13 +147,15 @@ public class RAGMCPServer extends MCPServerBase {
         final JSONObject search = new JSONObject();
         search.put("name", "search_code");
         search.put("description",
-                "Semantic search over this project's local code index. " +
-                "Returns the top-K chunks most similar to the natural-language query " +
-                "(file path, line range, symbol, score, snippet). Use when grep is too narrow " +
-                "or when you do not know the exact symbol name. After picking a hit, follow up " +
-                "with the Read tool on the returned absolute_path + line range to see the full code, " +
-                "or call get_chunk for just that chunk's content. The project scope is determined " +
-                "by the MCP endpoint URL — every result is from this project's index only.");
+                "Find code by concept rather than by literal text. Preferred for \"where do " +
+                "we handle X\", \"what code does Y\", or \"find anything related to Z\" questions " +
+                "on this project — it does similarity search over the indexed tree and surfaces " +
+                "related code that grep misses because the matching files do not contain the " +
+                "keyword. Returns top-K chunks (file path, line range, symbol, score, snippet). " +
+                "Prefer this over Grep/Glob whenever you do not already know an exact token to " +
+                "search for. After picking a hit, Read the absolute_path + line range for " +
+                "surrounding context, or call get_chunk for just that chunk. Project scope is " +
+                "fixed by the MCP endpoint — all results are from this project only.");
         search.put("inputSchema", buildSchema(
                 "search_code input",
                 new String[]{"query"},
