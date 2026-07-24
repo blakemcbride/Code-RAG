@@ -54,6 +54,7 @@ public class MainServlet extends HttpServlet {
     private static boolean hasDatabase;              // determined by application.ini
     private static Cron cron;
     private static final Set<String> allowedWithoutAuthentication = new HashSet<>();
+    private static final String bootId = java.util.UUID.randomUUID().toString();  // unique per server start
     private static final Hashtable<String,Object> environment = new Hashtable<>();  // general application-specific values
     /** True if running on Linux. */
     public static boolean isLinux = false;
@@ -207,7 +208,7 @@ public class MainServlet extends HttpServlet {
                     makeDatabaseConnection();
                 } catch (PropertyVetoException | SQLException | ClassNotFoundException e) {
                     logger.error(e);
-                    //System.exit(-1);  // This kills tomcat which you do not want to do on a production system
+                    databaseConnectionFatal(e);
                     throw new RuntimeException("Initialization failed", e);
                 }
                 logger.info("* * * Database " + databaseName + " opened successfully");
@@ -239,6 +240,35 @@ public class MainServlet extends HttpServlet {
     }
 
     /**
+     * A database is configured but cannot be reached at startup.  Nothing in the
+     * application can work in this state, so this logs an unmistakable banner
+     * naming the database and the underlying error.  The caller then throws,
+     * which aborts this web application's deployment; the servlet container
+     * itself is left running so other applications it hosts are unaffected.
+     */
+    private static void databaseConnectionFatal(Exception e) {
+        String host = (String) environment.get("DatabaseHost");
+        Integer port = getEnvironmentInt("DatabasePort");
+        String msg = "\n" +
+                "**********************************************************************\n" +
+                "*  FATAL: cannot connect to the configured database.\n" +
+                "*\n" +
+                "*      " + e.getMessage() + "\n" +
+                "*\n" +
+                "*      Database: " + host + (port == null ? "" : ":" + port) + ":" + databaseName + "\n" +
+                "*\n" +
+                "*  The application cannot run without its configured database.\n" +
+                "*  Verify that the database server is running, that the database\n" +
+                "*  exists, and that the Database* settings in application.ini are\n" +
+                "*  correct; then restart.\n" +
+                "*\n" +
+                "*  THIS APPLICATION HAS BEEN DISABLED.  The servlet container\n" +
+                "*  itself has been left running.\n" +
+                "**********************************************************************";
+        logger.fatal(msg);
+    }
+
+    /**
      * Returns a new connection to the database if one is configured.
      * If you explicitly open a new connection with this method you must explicitly close it via the closeConnection method.
      * <br><br>
@@ -267,6 +297,41 @@ public class MainServlet extends HttpServlet {
         return db;
     }
 
+    /** Application-registered hook that prepares each request's database connection (see {@link RequestConnectionPreparer}). */
+    private static RequestConnectionPreparer requestConnectionPreparer;
+
+    /**
+     * Register an application hook that prepares the per-request database connection
+     * after authentication and before the web service method executes, and clears
+     * per-request connection state when the connection is closed.  Typically called
+     * from <code>KissInit.groovy</code>.  See {@link RequestConnectionPreparer} for
+     * the contract and the multi-tenant use case.
+     *
+     * @param preparer the hook, or null to remove a previously registered hook
+     */
+    public static void setRequestConnectionPreparer(RequestConnectionPreparer preparer) {
+        requestConnectionPreparer = preparer;
+    }
+
+    /**
+     * Get the registered request-connection preparer.
+     *
+     * @return the registered hook, or null when none is registered
+     */
+    public static RequestConnectionPreparer getRequestConnectionPreparer() {
+        return requestConnectionPreparer;
+    }
+
+    private static void releaseRequestConnection(Connection db) {
+        if (requestConnectionPreparer != null  &&  db != null  &&  db.isOpen()) {
+            try {
+                requestConnectionPreparer.release(db);
+            } catch (Exception e) {
+                logger.error("RequestConnectionPreparer.release failed", e);
+            }
+        }
+    }
+
     /**
      * Closes a connection to the database opened with openNewConnection.
      * Commits or rolls back the transaction according to the success parameter.
@@ -275,6 +340,7 @@ public class MainServlet extends HttpServlet {
      * @see #closeConnection(Connection db, boolean success)
      */
     public static void closeConnection(Connection db) {
+        releaseRequestConnection(db);
         if (db != null &&  db.isOpen()) {
             java.sql.Connection sconn = null;
             try {
@@ -301,6 +367,7 @@ public class MainServlet extends HttpServlet {
      * @see #closeConnection(Connection db)
      */
     public static void closeConnection(Connection db, boolean success) {
+        releaseRequestConnection(db);
         boolean doClose = true;
         try {
             if (db != null && db.isOpen()) {
@@ -629,6 +696,17 @@ public class MainServlet extends HttpServlet {
 
     static boolean shouldAllowWithoutAuthentication(String className, String methodName) {
         return allowedWithoutAuthentication.contains(className + ":" + methodName);
+    }
+
+    /**
+     * A unique id generated once each time the server starts.  It is returned to the
+     * front-end (as <code>_BootId</code>); the front-end records it and forces a re-login
+     * when it changes, so a back-end restart invalidates persisted client sessions.
+     *
+     * @return the server boot id
+     */
+    public static String getBootId() {
+        return bootId;
     }
 
     /**

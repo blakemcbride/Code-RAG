@@ -14,10 +14,13 @@
  * minimum steps necessary to rebuild a system are actually executed.  So, this 
  * build system runs as fast as the others.
  *
- * There are two classes as follows:
+ * The build system is made up of the following classes:
  *
- *     BuildUtils -  the generic utilities needed to build
- *     Tasks      -  the application-specific build procedures (or tasks)
+ *     BuildUtils     -  the generic build utilities (this file; also usable
+ *                       as part of a generic build system unrelated to Kiss)
+ *     KissBuildUtils -  build procedures common to all Kiss-framework
+ *                       applications (present only in Kiss projects)
+ *     Tasks          -  the application-specific build procedures (or tasks)
  */
 
 package org.kissweb;
@@ -28,9 +31,7 @@ import org.apache.commons.compress.archivers.tar.TarArchiveInputStream;
 import java.io.*;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
-import java.net.HttpURLConnection;
 import java.net.URI;
-import java.net.URL;
 import java.nio.file.*;
 import java.util.ArrayList;
 import java.util.regex.Pattern;
@@ -136,9 +137,23 @@ public class BuildUtils {
                 case "-h":
                 case "--help":
                     println("Use: bld  list-tasks         to get a list of tasks");
-                    println("Use: bld  [-v]  <task>       to execute the task");
+                    println("Use: bld  [option]... <task> to execute the task");
                     println("Use: bld  help               this message");
                     println("Use: bld  version            display version of bld");
+                    println("");
+                    println("Options:");
+                    println("  -v, --verbose                     verbose output (must precede the task)");
+                    println("  -h, --help                        same as help");
+                    println("  --version                         same as version");
+                    //  Like listTasks above, the tasks class may supply an optional
+                    //  listOptions method that documents any additional options it
+                    //  consumes before task dispatch.
+                    try {
+                        Method listOptionsMethod = tasksClass.getMethod("listOptions");
+                        listOptionsMethod.invoke(null);
+                    } catch (Exception e) {
+                        // ignore
+                    }
                     break;
                 case "-v":
                 case "--verbose":
@@ -205,15 +220,6 @@ public class BuildUtils {
                         return found.getParentFile().getParentFile().getAbsolutePath();
                 }
         return null;
-    }
-
-    /**
-     * Gets the absolute path to the local Tomcat installation directory.
-     *
-     * @return the absolute path to the tomcat directory
-     */
-    public static String getTomcatPath() {
-        return (new File("tomcat")).getAbsolutePath();
     }
 
     /**
@@ -1650,20 +1656,5 @@ public class BuildUtils {
         }
 
         return result.toString();
-    }
-
-    /**
-     * Send a request to stop the development frontend server.
-     */
-    public static void stopFrontendServer() {
-        try {
-            URL url = URI.create("http://localhost:8000/stop-server").toURL();
-            HttpURLConnection connection = (HttpURLConnection) url.openConnection();
-            connection.setRequestMethod("GET");
-            connection.getInputStream().close();
-            connection.disconnect();
-        } catch (IOException e) {
-            //e.printStackTrace();
-        }
     }
 }

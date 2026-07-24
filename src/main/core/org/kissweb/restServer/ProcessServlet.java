@@ -375,12 +375,13 @@ public class ProcessServlet implements Runnable {
                         }
                     }
                     response.setContentType("application/json");
+                    response.setCharacterEncoding(StandardCharsets.UTF_8.name());
                     response.setStatus(200);
                     JSONObject errorJson = new JSONObject();
                     errorJson.put("_Success", false);
                     errorJson.put("_ErrorMessage", "Invalid JSON format");
                     errorJson.put("_ErrorCode", -1);
-                    out.print(errorJson.toString());
+                    writeJsonText(errorJson.toString());
                     out.flush();
                     out.close();
                     asyncContext.complete();
@@ -466,6 +467,19 @@ public class ProcessServlet implements Runnable {
             }
         }
 
+        //  Let a registered application hook prepare the request's connection (e.g. select a
+        //  per-tenant schema) now that authentication has completed.  A failure aborts the
+        //  request before any service code runs.
+        RequestConnectionPreparer preparer = MainServlet.getRequestConnectionPreparer();
+        if (preparer != null  &&  DB != null) {
+            try {
+                preparer.prepare(DB, ud);
+            } catch (Exception e) {
+                errorReturn(response, "Unable to prepare the database connection for this request", e);
+                return;
+            }
+        }
+
         res = (new GroovyService()).tryGroovy(this, response, _className, _method, injson, outjson);
         if (res == ProcessServlet.ExecutionReturn.Error)
             return;
@@ -503,6 +517,22 @@ public class ProcessServlet implements Runnable {
     public void returnBinary(byte [] data) {
         isBinaryReturn = true;
         binaryData = data;
+    }
+
+    /**
+     * Set the async timeout for the current request, in milliseconds.  A value of zero or less
+     * means no timeout (the request may run to completion however long it takes).
+     * <br><br>
+     * Call this from a long-running service (for example one that waits on a slow LLM generation)
+     * before the work begins.  Without it, the servlet container's default async timeout (typically
+     * 30 seconds) applies, and a longer call is severed mid-flight -- which the front-end surfaces as
+     * a generic "Error communicating with the server" message.  Normal requests need not call this;
+     * they keep the default timeout as a safety net.
+     *
+     * @param ms the timeout in milliseconds; zero or less means no timeout
+     */
+    public void setTimeout(long ms) {
+        asyncContext.setTimeout(ms);
     }
 
     /**
@@ -681,6 +711,10 @@ public class ProcessServlet implements Runnable {
         }
     }
 
+    private void writeJsonText(String text) throws IOException {
+        out.write(text.getBytes(StandardCharsets.UTF_8));
+    }
+
     /**
      * Returns a successful response to the front-end.
      *
@@ -701,13 +735,15 @@ public class ProcessServlet implements Runnable {
                 DB.commit();
             outjson.put("_Success", true);
             outjson.put("_ErrorCode", 0);  // success
+            outjson.put("_BootId", MainServlet.getBootId());
             response.setStatus(200);
             if (!isBinaryReturn) {
                 response.setContentType("application/json");
-                out.print(outjson.toString());
+                response.setCharacterEncoding(StandardCharsets.UTF_8.name());
+                writeJsonText(outjson.toString());
             } else {
                 response.setContentType("application/octet-stream");
-                out.print(outjson.toString() + "\003");
+                writeJsonText(outjson.toString() + "\003");
                 if (binaryData != null) {
                     out.write(binaryData);
                     binaryData = null;
@@ -740,6 +776,14 @@ public class ProcessServlet implements Runnable {
      * @param e the exception that caused the error, or null if none
      */
     void errorReturn(HttpServletResponse response, String msg, Throwable e) {
+        //  A service that ran without authentication can signal it needs a logged-in user
+        //  by throwing LoginRequiredException (via requireLogin()).  Route that to the
+        //  standard "not logged in" response (_ErrorCode = 2) regardless of which service
+        //  runner caught and forwarded it here.
+        if (containsLoginRequired(e)) {
+            loginFailure(response, e);
+            return;
+        }
         int errorCode;
         if (e instanceof ServerException)
             errorCode = ((ServerException) e).getErrorCode();
@@ -760,6 +804,7 @@ public class ProcessServlet implements Runnable {
                 }
             }
             response.setContentType("application/json");
+            response.setCharacterEncoding(StandardCharsets.UTF_8.name());
             response.setStatus(200);
             JSONObject outjson = new JSONObject();
             outjson.put("_Success", false);
@@ -767,7 +812,7 @@ public class ProcessServlet implements Runnable {
             outjson.put("_ErrorCode", errorCode);
             if (!(e instanceof UserException))
                 log_error(msg, e);
-            out.print(outjson.toString());
+            writeJsonText(outjson.toString());
             out.flush();
             out.close();  //  this causes the second response
         } catch (Exception ignored) {
@@ -801,13 +846,15 @@ public class ProcessServlet implements Runnable {
         }
         // Note: closeSession() is now handled in the outer run() finally block
         response.setContentType("application/json");
+        response.setCharacterEncoding(StandardCharsets.UTF_8.name());
         response.setStatus(200);
         JSONObject outjson = new JSONObject();
         outjson.put("_Success", false);
         outjson.put("_ErrorMessage", msg);
         outjson.put("_ErrorCode", 2);  // login failure
+        outjson.put("_BootId", MainServlet.getBootId());
         try {
-            out.print(outjson.toString());
+            writeJsonText(outjson.toString());
             out.flush();
             out.close();  //  this causes the second response
         } catch (IOException ignore) {
@@ -832,7 +879,7 @@ public class ProcessServlet implements Runnable {
     /**
      * Get all user data.
      *
-     * @return the UserData instance for the current user
+     * @return the UserData instance for the current user, or null if not logged in
      */
     public UserData getUserData() {
         return ud;
@@ -842,10 +889,57 @@ public class ProcessServlet implements Runnable {
      * Get a specific user data element.
      *
      * @param key the key for the user data element
-     * @return the user data element, or null if not found
+     * @return the user data element, or null if not found (or not logged in)
      */
     public Object getUserData(String key) {
-        return ud.getUserData(key);
+        return ud == null ? null : ud.getUserData(key);
+    }
+
+    /**
+     * Whether the current request is from a logged-in user.
+     * <br><br>
+     * Useful in a service registered with
+     * {@link MainServlet#allowWithoutAuthentication(String, String)}, which runs whether
+     * or not the caller is authenticated: branch on this to do one thing when logged in
+     * and another when not.
+     *
+     * @return true if a valid user session is associated with this request
+     *
+     * @see #requireLogin()
+     */
+    public boolean isLoggedIn() {
+        return ud != null;
+    }
+
+    /**
+     * Require a logged-in user for the remainder of this service call.
+     * <br><br>
+     * Intended for a service registered with
+     * {@link MainServlet#allowWithoutAuthentication(String, String)} that, after some
+     * unauthenticated work, decides it needs an authenticated user.  When no user is
+     * logged in this aborts the call with the standard "not logged in" response
+     * (<code>_ErrorCode = 2</code>), the same response a normally-protected method
+     * produces, so the front-end routes the user to login.
+     *
+     * @see #isLoggedIn()
+     */
+    public void requireLogin() {
+        if (ud == null)
+            throw new LoginRequiredException("Login required.");
+    }
+
+    /**
+     * True if a LoginRequiredException appears anywhere in the cause chain.  Service
+     * runners wrap the thrown exception (e.g. in InvocationTargetException) and forward
+     * it to errorReturn, so the chain is walked rather than checking the top type.
+     */
+    private static boolean containsLoginRequired(Throwable e) {
+        while (e != null) {
+            if (e instanceof LoginRequiredException)
+                return true;
+            e = e.getCause();
+        }
+        return false;
     }
 
     /**
