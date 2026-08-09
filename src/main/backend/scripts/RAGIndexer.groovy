@@ -397,12 +397,15 @@ class RAGIndexer {
         Map<String, Map<String, Object>> existing = [:]
         if (!fullRebuild) {
             List<Record> rows = db.fetchAll(
-                    "SELECT file_id, repo, path, sha256 FROM ${project}.rag_file".toString())
+                    "SELECT file_id, repo, path, sha256, mtime FROM ${project}.rag_file".toString())
             for (Record r : rows) {
                 String key = r.getString("repo") + "::" + r.getString("path")
                 existing[key] = [
                         file_id: r.getLong("file_id"),
-                        sha256: r.getString("sha256")
+                        sha256: r.getString("sha256"),
+                        // Carried so an unchanged file whose timestamp drifted can be
+                        // re-synced; otherwise it would read as permanently stale.
+                        mtime: r.getDateTime("mtime")
                 ]
             }
         }
@@ -513,6 +516,17 @@ class RAGIndexer {
         String sha = sha256(bytes)
 
         if (existingRow != null && existingRow.sha256 == sha) {
+            // Content is unchanged, but the timestamp may have moved (a touch, a
+            // checkout, a build). Search results flag a hit as stale by comparing
+            // the file's mtime on disk with the one recorded here, so a drifted
+            // mtime that is never corrected would mark the file stale forever.
+            // Re-sync it; this is a no-op for the overwhelming majority of files.
+            long onDisk = file.lastModified()
+            Date known = (Date) existingRow.mtime
+            if (known == null || known.getTime() != onDisk) {
+                db.execute("UPDATE ${cfg.project}.rag_file SET mtime = ? WHERE file_id = ?".toString(),
+                           new java.sql.Timestamp(onDisk), existingRow.file_id)
+            }
             stats.filesUnchanged++
             return
         }

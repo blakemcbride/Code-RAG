@@ -133,6 +133,12 @@ public final class RAGSearch {
         public boolean expanded;
         /** Chunk body — or the whole enclosing symbol when {@link #expanded}. */
         public String content;
+        /** File mtime recorded when this was indexed, epoch millis. */
+        public long indexedMtime;
+        /** The file has changed on disk since indexing — content/lines may be wrong. */
+        public boolean stale;
+        /** The file no longer exists on disk. */
+        public boolean missing;
     }
 
     /**
@@ -158,6 +164,12 @@ public final class RAGSearch {
         public int bestStartLine;
         public int bestEndLine;
         public boolean bestExpanded;
+        /** File mtime recorded when this was indexed, epoch millis. */
+        public long indexedMtime;
+        /** The file has changed on disk since indexing — content/lines may be wrong. */
+        public boolean stale;
+        /** The file no longer exists on disk. */
+        public boolean missing;
     }
 
     /** How many of a file's chunk scores contribute to its aggregate score. */
@@ -685,6 +697,7 @@ public final class RAGSearch {
                 fh.bestEndLine = rep.endLine;
                 fh.bestExpanded = rep.expanded;
             }
+            markFileStaleness(project, files);
             out.fileHits.addAll(files);
         } else {
             final List<Hit> selected = applyDiversity(dedupeHits(reranked), k, perFile);
@@ -692,6 +705,7 @@ public final class RAGSearch {
                 expandToSymbols(conn, project, selected, expandCeiling);
             if (req.includeNeighbors > 0)
                 attachNeighbors(conn, project, selected, req.includeNeighbors, expandCeiling);
+            markStaleness(project, selected);
             out.hits.addAll(selected);
         }
         out.queryMillis = System.currentTimeMillis() - t1;
@@ -984,7 +998,7 @@ public final class RAGSearch {
             return;
 
         final StringBuilder sql = new StringBuilder(
-                "SELECT f.file_id, f.repo, f.path, f.language, f.summary " +
+                "SELECT f.file_id, f.repo, f.path, f.language, f.mtime, f.summary " +
                 "  FROM " + project + ".rag_file f " +
                 " WHERE f.summary_embedding IS NOT NULL");
         if (req.repo != null && !req.repo.isEmpty())
@@ -1016,6 +1030,8 @@ public final class RAGSearch {
                         fh.repo = rs.getString("repo");
                         fh.path = rs.getString("path");
                         fh.language = rs.getString("language");
+                        final Timestamp smt = rs.getTimestamp("mtime");
+                        fh.indexedMtime = smt == null ? 0L : smt.getTime();
                         fh.matchCount = 0;
                         // No chunk was retrieved for this file, so the summary
                         // itself is the best excerpt we can show.
@@ -1054,7 +1070,7 @@ public final class RAGSearch {
 
         final StringBuilder sql = new StringBuilder(
                 "SELECT s.file_id, s.symbol, s.sym_start_line, s.sym_end_line, s.summary, " +
-                "       f.repo, f.path, f.language " +
+                "       f.repo, f.path, f.language, f.mtime " +
                 "  FROM " + project + ".rag_symbol s JOIN " + project + ".rag_file f USING (file_id) " +
                 " WHERE TRUE");
         appendFilters(sql, req);
@@ -1087,6 +1103,8 @@ public final class RAGSearch {
                         fh.repo = rs.getString("repo");
                         fh.path = rs.getString("path");
                         fh.language = rs.getString("language");
+                        final Timestamp ymt = rs.getTimestamp("mtime");
+                        fh.indexedMtime = ymt == null ? 0L : ymt.getTime();
                         byId.put(fileId, fh);
                         files.add(fh);
                     }
@@ -1130,6 +1148,7 @@ public final class RAGSearch {
                 fh.repo = h.repo;
                 fh.path = h.path;
                 fh.language = h.language;
+                fh.indexedMtime = h.indexedMtime;
                 byFile.put(h.fileId, fh);
                 // `ranked` is best-first, so the first chunk seen for a file is
                 // its best one.
@@ -1241,6 +1260,54 @@ public final class RAGSearch {
                 boiler++;
         }
         return considered >= 3 && boiler * 100 / considered >= 80;
+    }
+
+    /**
+     * Flag results whose file has changed on disk since it was indexed.
+     * <br><br>
+     * The index is only as current as the last sweep, which runs every few
+     * minutes. Between a file being edited and the next sweep, a search returns
+     * the OLD content and the OLD line numbers with no indication that anything
+     * is wrong — so an agent can read stale code and act on it confidently.
+     * That is a correctness problem, not a ranking one, which is why the answer
+     * is to tell the truth about it rather than to hide or demote the result:
+     * a stale hit is still almost certainly the right FILE.
+     * <br><br>
+     * Comparison is against the mtime recorded at index time, not against
+     * indexed_at — the question is "has the file moved on since we read it",
+     * and only the file's own timestamp answers that. One stat() per returned
+     * hit; at k=8 that is not measurable.
+     */
+    private static void markStaleness(String project, List<Hit> hits) {
+        for (Hit h : hits) {
+            final long disk = diskMtime(project, h.repo, h.path);
+            if (disk == -1L)
+                h.missing = true;
+            else if (h.indexedMtime > 0L && disk != h.indexedMtime)
+                h.stale = true;
+        }
+    }
+
+    private static void markFileStaleness(String project, List<FileHit> files) {
+        for (FileHit f : files) {
+            final long disk = diskMtime(project, f.repo, f.path);
+            if (disk == -1L)
+                f.missing = true;
+            else if (f.indexedMtime > 0L && disk != f.indexedMtime)
+                f.stale = true;
+        }
+    }
+
+    /** Current mtime of a result's file, or -1 when it no longer exists. */
+    private static long diskMtime(String project, String repo, String path) {
+        try {
+            final java.io.File f = new java.io.File(absolutePath(project, repo, path));
+            if (!f.isFile())
+                return -1L;
+            return f.lastModified();
+        } catch (Exception e) {
+            return 0L;   // unknown: do not claim staleness we cannot prove
+        }
     }
 
     /** Cap on tsquery terms — bounds worst-case cost on a rambling query. */
@@ -1370,6 +1437,8 @@ public final class RAGSearch {
             for (Map.Entry<String, List<Hit>> e : byProject.entrySet())
                 expandToSymbols(conn, e.getKey(), e.getValue(), ceiling);
         }
+        for (Hit h : selected)
+            markStaleness(h.project, java.util.Collections.singletonList(h));
         out.hits.addAll(selected);
         out.queryMillis = System.currentTimeMillis() - t1;
         return out;
@@ -1408,7 +1477,7 @@ public final class RAGSearch {
     }
 
     private static final String HIT_COLUMNS =
-            "c.chunk_id, c.file_id, f.repo, f.path, f.language, " +
+            "c.chunk_id, c.file_id, f.repo, f.path, f.language, f.mtime, " +
             "c.start_line, c.end_line, c.symbol, c.content, " +
             "c.sym_start_line, c.sym_end_line ";
 
@@ -1425,6 +1494,8 @@ public final class RAGSearch {
         h.content = rs.getString("content");
         h.symStartLine = rs.getInt("sym_start_line");
         h.symEndLine = rs.getInt("sym_end_line");
+        final Timestamp mt = rs.getTimestamp("mtime");
+        h.indexedMtime = mt == null ? 0L : mt.getTime();
         return h;
     }
 

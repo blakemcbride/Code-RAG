@@ -308,6 +308,14 @@ search would give.
   is not matched, so that chunk is attributed to the previous method. Use
   `rag_def` (ctags) for anything that needs to be correct about where a
   symbol is defined.
+- **Staleness is detected by mtime, so mtime must be kept honest.** Search
+  hits carry `stale: true` when the file's mtime on disk differs from the
+  one recorded at index time. The sweep detects *content* change by
+  sha256 and skips unchanged files — so a file whose timestamp moved
+  without its content changing (a `touch`, a checkout, a build) would
+  never have its stored mtime corrected and would read as stale forever.
+  `indexOneFile` therefore re-syncs mtime on the unchanged path. If you
+  add another early return there, re-sync mtime too.
 - **A retrieval score is only as honest as its expectations.** The first
   stack360 eval read as a catastrophe (hit@1 0.257) and was almost
   entirely an artifact of the query set naming one arbitrary file where

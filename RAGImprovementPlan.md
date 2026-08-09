@@ -5,6 +5,30 @@ with Grep alone, and then make it do things Grep structurally cannot.
 
 ---
 
+## Staleness: results now admit when they are out of date
+
+The index is only as current as the last sweep. Between an edit and the next
+sweep, `search_code` returned the OLD content and OLD line numbers with no
+indication anything was wrong — an agent could read stale code and act on it
+confidently. That is a correctness problem, not a ranking one.
+
+Hits now carry `stale: true` (file changed on disk since indexing) or
+`missing: true` (file gone), with a count and an explicit instruction at the
+envelope level so it is not missed while scanning results. Stale hits are still
+returned and still ranked normally: the file is almost certainly still the right
+answer, only the snapshot is old.
+
+Building it surfaced a flaw in the obvious implementation. The sweep detects
+change by **sha256**, so a file whose mtime moved without its content changing
+— a `touch`, a checkout, a build — is skipped and its stored mtime never
+corrected. Comparing disk mtime against that stale record would have flagged
+such files as out of date *permanently*. `indexOneFile` now re-syncs mtime on
+the unchanged path; measured drift afterwards is 0 of 334 files on kiss and
+0 of 472 on ownsona.
+
+Verified end to end: clean, then `stale=true` with an envelope warning after a
+`touch`, then clear again after a sweep.
+
 ## Impact analysis, reference precision, and proof of use
 
 **Import graph (`find_dependents`).** 46,000 import edges across the three

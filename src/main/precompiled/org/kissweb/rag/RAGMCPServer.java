@@ -379,6 +379,10 @@ public class RAGMCPServer extends MCPServerBase {
                 hit.put("score", h.score);
                 if (h.expanded)
                     hit.put("expanded_to_symbol", true);
+                if (h.stale)
+                    hit.put("stale", true);
+                if (h.missing)
+                    hit.put("missing", true);
                 putBody(hit, h.content, maxChars);
                 ahits.put(hit);
             }
@@ -388,6 +392,7 @@ public class RAGMCPServer extends MCPServerBase {
             env.put("query", req.query);
             env.put("granularity", "chunk");
             env.put("count", ahits.length());
+            addStaleWarning(env, ahits);
             env.put("hits", ahits);
             return toolResult(env.toString(2));
         }
@@ -417,6 +422,10 @@ public class RAGMCPServer extends MCPServerBase {
                 hit.put("end_line", fh.bestEndLine);
                 if (fh.bestExpanded)
                     hit.put("expanded_to_symbol", true);
+                if (fh.stale)
+                    hit.put("stale", true);
+                if (fh.missing)
+                    hit.put("missing", true);
                 putBody(hit, fh.bestContent, maxChars);
                 hits.put(hit);
             }
@@ -434,6 +443,10 @@ public class RAGMCPServer extends MCPServerBase {
                 hit.put("score", h.score);
                 if (h.expanded)
                     hit.put("expanded_to_symbol", true);
+                if (h.stale)
+                    hit.put("stale", true);
+                if (h.missing)
+                    hit.put("missing", true);
                 putBody(hit, h.content, maxChars);
                 hits.put(hit);
             }
@@ -443,6 +456,7 @@ public class RAGMCPServer extends MCPServerBase {
         envelope.put("query", req.query);
         envelope.put("granularity", req.granularity);
         envelope.put("count", hits.length());
+        addStaleWarning(envelope, hits);
         envelope.put("hits", hits);
         logSearch(proj, "search_code", req.query, hits, result.embedMillis + result.queryMillis);
         return toolResult(envelope.toString(2));
@@ -459,6 +473,34 @@ public class RAGMCPServer extends MCPServerBase {
             paths.append(h.getString("repo", "")).append('/').append(h.getString("path", ""));
         }
         RAGSearch.logUsage(project, "search", tool, query, paths.toString(), latencyMs);
+    }
+
+    /**
+     * Summarise staleness at the envelope level.
+     *
+     * A per-hit flag is easy to miss when scanning results; a single count with
+     * an explicit instruction is not. Stale hits are still returned and still
+     * ranked normally — the file is almost certainly right, only the snapshot
+     * is old — so the correct response is to re-read, not to distrust the hit.
+     */
+    private static void addStaleWarning(JSONObject envelope, JSONArray hits) {
+        int stale = 0, missing = 0;
+        for (int i = 0; i < hits.length(); i++) {
+            final JSONObject h = hits.getJSONObject(i);
+            if (h.getBoolean("stale", Boolean.FALSE))
+                stale++;
+            if (h.getBoolean("missing", Boolean.FALSE))
+                missing++;
+        }
+        if (stale > 0)
+            envelope.put("stale_results", stale);
+        if (missing > 0)
+            envelope.put("missing_results", missing);
+        if (stale > 0 || missing > 0)
+            envelope.put("staleness_note",
+                    "Some files changed on disk after they were indexed; their content and line "
+                    + "numbers here may be out of date. Read the absolute_path for current content, "
+                    + "or call reindex_path on them to refresh the index.");
     }
 
     /** Attach a body to a hit, applying the per-hit character budget. */
