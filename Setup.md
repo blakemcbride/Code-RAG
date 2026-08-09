@@ -414,9 +414,11 @@ note — `code-rag new-project my-proj /path` is accepted and stored as
 **umbrella directory above the roots** — typically where you launch
 `claude` for the project. When set, bld additionally drops a
 `.mcp.json` in `<dir>` (so the MCP tool is visible from the umbrella)
-and writes a managed CLAUDE.md routing snippet in `<dir>/CLAUDE.md`
-(so Claude Code prefers `search_code` for conceptual queries over
-Grep). `<dir>` is *not* indexed — only the explicit `roots` are
+and writes a managed routing snippet in `<dir>/CLAUDE.md`. (A routing
+block is written into `<root>/CLAUDE.local.md` for **every** indexed
+root regardless of `project_dir`, so Claude Code knows when to prefer
+`search_code` / `search_history` over Grep; `project_dir` only adds the
+umbrella copy.) `<dir>` is *not* indexed — only the explicit `roots` are
 scanned. The argument must be an existing directory, must not equal
 one of the roots, and may not be `$HOME` or `/`. For an existing
 project, hand-edit `rag-projects.json` to add a `"project_dir": "..."`

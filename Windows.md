@@ -117,7 +117,8 @@ with a path-translation feature specifically for this case.
    inside the VM to `127.0.0.1:17080` on the Windows host. No
    configuration needed; just verify it works (next section).
 
-2. **Returned file paths** — when `search_code` returns a hit, the
+2. **Returned file paths** — when `search_code` (or `find_symbol`,
+   `find_dependents`, `get_chunk`) returns a hit, the
    `absolute_path` field needs to be something the Windows-native
    `Read` tool can actually open. Code-RAG handles this with an opt-in
    header.

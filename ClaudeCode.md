@@ -23,7 +23,7 @@ point of confusion is mixing up their roles, so:
 |---|---|---|---|
 | `src/main/backend/rag-projects.json` | Tells the Code-RAG **server** which code trees to index. One JSON entry per project: `name`, absolute `roots[]`, optional `project_dir`, optional `excludeGlobs`. Gitignored — the committed `.example` is just a template. | You (hand-edit). | When adding/removing a project, changing its roots, or setting/clearing `project_dir`. Restart Kiss after editing so the new schema gets bootstrapped. |
 | `<project_root>/.mcp.json` and `<project_dir>/.mcp.json` | Tells **Claude Code** which MCP servers are available when launched from this tree. One file per configured root, plus one in `project_dir` if set. Code-RAG writes them automatically. | `bld` (via `claude mcp add -s project`). Don't hand-edit unless you have to. | Maintained automatically by `bld new-project`, `add-root`, `remove-root`, `remove-project`, and `bld start`. |
-| `<project_dir>/CLAUDE.md` (managed block only) | Tells **Claude Code** how to choose between MCP `search_code` and native Grep. Only written when `project_dir` is set on the project. Bld manages a marker-delimited block; anything outside the markers is left alone. | `bld`. Don't edit *between* the markers — bld will overwrite it. | Maintained automatically alongside the matching `.mcp.json`. Removed by `bld remove-project`. |
+| `<root>/CLAUDE.local.md` (managed block only) | Tells **Claude Code** when to prefer `search_code` / `search_history` over native Grep. Written into **every indexed root** on each `bld start`. `CLAUDE.local.md` rather than `CLAUDE.md` so a tracked, possibly shared file is never modified — and because some repos forbid editing their `CLAUDE.md`. Disable with `RAGWriteRoutingRules = false`. Bld manages a marker-delimited block; anything outside the markers is left alone. | `bld`. Don't edit *between* the markers — bld will overwrite it. | Maintained automatically alongside the matching `.mcp.json`. Removed by `bld remove-project`. |
 
 The two files don't communicate directly. The **bridge is the URL**: in
 each `.mcp.json` you have an MCP entry with URL
@@ -226,8 +226,7 @@ If Claude can't see the `mcp__myproj__*` tools, check:
        -H 'Content-Type: application/json' \
        -d '{"jsonrpc":"2.0","method":"tools/list","id":1}' | python3 -m json.tool
    ```
-   If this returns the four tools (`search_code`, `get_chunk`,
-   `list_repos`, `index_status`), the server is healthy and the
+   If this returns the tools (`search_code`, `search_history`, `find_symbol`, `find_dependents`, `get_chunk`, `reindex_path`, `list_repos`, `index_status`), the server is healthy and the
    problem is on the Claude Code side. If it doesn't, the server isn't
    running or the secret is wrong — see [Running.md](Running.md).
 4. **You restarted the Claude Code session after registering.** MCP
@@ -238,7 +237,9 @@ If Claude can't see the `mcp__myproj__*` tools, check:
 
 **Tool name prefix.** Claude Code surfaces each MCP server's tools as
 `mcp__<entry-name>__<tool-name>`. So with the registration above the
-tools are `mcp__myproj__search_code`, `mcp__myproj__get_chunk`,
+tools are `mcp__myproj__search_code`, `mcp__myproj__search_history`,
+`mcp__myproj__find_symbol`, `mcp__myproj__find_dependents`,
+`mcp__myproj__reindex_path`, `mcp__myproj__get_chunk`,
 `mcp__myproj__list_repos`, `mcp__myproj__index_status`.
 
 **Project scope means no ad-hoc cross-project search.** If you launch

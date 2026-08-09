@@ -88,10 +88,26 @@ ollama pull nomic-embed-text:v1.5
 #    the script knows where the installation lives.
 ```
 
-In any subsequent agent session inside that project's working tree, ask
-something like *"use mcp__myproj__search_code to find where the
-authentication flow happens"* — the agent will call the tool, then `Read`
-the top hit.
+In any subsequent agent session inside that project's working tree, just
+ask the question — `bld start` drops a routing note into each indexed
+root's `CLAUDE.local.md` telling Claude Code when to prefer these tools
+over Grep, so you normally do not have to name the tool at all.
+
+Beyond `search_code`, the server exposes `search_history` (why something
+changed — git *and* Subversion), `find_symbol` (where a symbol is defined,
+what calls it, what tests cover it), `find_dependents` (what breaks if I
+change this file), and `reindex_path` (make a file you just wrote
+searchable immediately).
+
+Optional passes add capability once indexing works:
+
+```bash
+./bld defs all       # symbol definitions   -> find_symbol       (seconds)
+./bld deps all       # import graph         -> find_dependents   (seconds)
+./bld history all    # commit messages      -> search_history    (minutes)
+./bld summarize all  # per-file LLM summary -> better search_code (hours, GPU)
+./bld usage all      # is any of this actually being called?
+```
 
 For the same procedure broken into named, verified steps (with expected
 output at each one), see [Setup.md](Setup.md).

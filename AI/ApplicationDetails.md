@@ -9,8 +9,12 @@ reference.
 Code-RAG is a single-machine, local MCP server that serves semantic
 code search to MCP-aware coding agents (Claude Code, OpenAI Codex CLI,
 etc.). It indexes one or more configured project trees into pgvector,
-exposes four MCP tools per project (`search_code`, `get_chunk`,
-`list_repos`, `index_status`), and is consumed via short HTTP calls.
+exposes eight MCP tools per project — `search_code`, `search_history`,
+`find_symbol`, `find_dependents`, `reindex_path`, `get_chunk`,
+`list_repos`, `index_status` — and is consumed via short HTTP calls.
+Two indexes back these: a **semantic** one (embeddings + per-file LLM
+summaries) and a **structural** one (ctags definitions + import graph)
+that needs no LLM.
 Built on Kiss + Tomcat 11 + PostgreSQL/pgvector + Ollama.
 
 The repo is named "Code-RAG" (renamed from Claude-RAG); the server

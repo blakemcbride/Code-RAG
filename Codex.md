@@ -190,14 +190,13 @@ curl -s -X POST http://127.0.0.1:17080/rag-mcp/stack360 \
     -d '{"jsonrpc":"2.0","method":"tools/list","id":1}' | python3 -m json.tool
 ```
 
-If this returns the four tools (`search_code`, `get_chunk`, `list_repos`,
-`index_status`), the server is healthy and the problem is in Codex's
+If this returns the tools (`search_code`, `search_history`, `find_symbol`, `find_dependents`, `get_chunk`, `reindex_path`, `list_repos`, `index_status`), the server is healthy and the problem is in Codex's
 config. If it doesn't, the server isn't running or the secret is
 wrong — see [Running.md](Running.md).
 
 ## 5. Caveats and trade-offs
 
-**The four tools are identical for any MCP client.** The server doesn't
+**The tools are identical for any MCP client.** The server doesn't
 know which agent is calling. So both Codex and Claude Code can register
 against the same Code-RAG instance and even hit it simultaneously —
 pgvector reads are concurrent-safe and there's no client identity in the
@@ -205,10 +204,10 @@ per-project lock model. Multiple agents on the same project at once is
 fine; they only contend on the shared Ollama GPU during query
 embedding, which is ~30 ms anyway.
 
-**Tool name prefix.** Codex surfaces the four tools under whatever
+**Tool name prefix.** Codex surfaces the tools under whatever
 naming convention it currently uses — that's a Codex implementation
 detail, not something the server controls. The four tool names
-themselves (`search_code`, `get_chunk`, `list_repos`, `index_status`)
+themselves (`search_code`, `search_history`, `find_symbol`, `find_dependents`, `get_chunk`, `reindex_path`, `list_repos`, `index_status`)
 are stable.
 
 **Per-project MCP entry rather than one shared.** This isn't strictly

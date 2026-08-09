@@ -5,6 +5,18 @@ want to extend, debug, or fork the system. The README, Overview, Setup,
 and Running docs are written for users; this one is written for the next
 developer.
 
+> **Status note.** This document describes the original design. The
+> retrieval pipeline has since been rebuilt and measured: `search_code` is
+> now a hybrid of dense, lexical and LLM-summary retrieval fused with RRF
+> and reranked, returning ranked *files* with symbol-expanded excerpts, and
+> the system has gained a structural index (ctags definitions + an import
+> graph) plus commit-history search. The sections below remain accurate for
+> the write path, schema-per-project layout, concurrency model and
+> deployment; for the current read path, the measurements behind each
+> decision, and the ideas that were tried and rejected, see
+> **[RAGImprovementPlan.md](RAGImprovementPlan.md)** and
+> **[AI/ApplicationDetails.md](AI/ApplicationDetails.md)**.
+
 ## 1. Goal
 
 Give Claude Code a fast, local, private semantic-search facility over one
@@ -319,7 +331,11 @@ schema-name string interpolation.
 
 | Tool | Returns |
 |---|---|
-| `search_code` | Top-K hits (chunk_id, repo, path, absolute_path, start_line, end_line, symbol, score, snippet). Optional repo/language/path_prefix filters. |
+| `search_code` | Ranked **files** by default (path, absolute_path, matched symbols, score, excerpt widened to the enclosing function); `granularity=chunk` for individual chunks. Optional repo/language/path_prefix filters. |
+| `search_history` | Commits matching a question about intent — git and Subversion. |
+| `find_symbol` | Definitions (ctags: kind, scope, signature, line) plus references classified `caller`/`test`/`doc`. |
+| `find_dependents` | Import-graph edges in either direction, each labelled `exact` or `name` confidence. |
+| `reindex_path` | Re-index named files immediately, so newly written code is searchable at once. |
 | `get_chunk` | The full content + metadata of one chunk by id. |
 | `list_repos` | One row per root configured for the project: name + file count + bytes + absolute root path. |
 | `index_status` | File / chunk counts, last-sweep stats, embedding meta, `indexing` boolean. |

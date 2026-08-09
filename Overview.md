@@ -8,20 +8,36 @@ do semantic search over your own codebases. You point it at one or more
 project directories. It walks them, chunks the source files, generates
 vector embeddings via a local Ollama model, and stores everything in a
 local PostgreSQL database with the `pgvector` extension. An MCP server
-exposes four tools (`search_code`, `get_chunk`, `list_repos`,
-`index_status`) that Claude Code can call to find relevant code by meaning,
-not just by keyword.
+exposes eight tools that Claude Code can call:
 
-Everything runs on your machine. The local LLM (Ollama with
-`nomic-embed-text:v1.5` by default) is used **only** for embeddings;
-generation stays with whatever Claude model the Claude Code session is
-already using. Nothing leaves the host.
+| Tool | Answers |
+|---|---|
+| `search_code` | "where do we handle X" — meaning, not keyword |
+| `search_history` | "why is this like this" — indexed git **and** Subversion commit messages |
+| `find_symbol` | "where is this defined, what calls it, what tests cover it" |
+| `find_dependents` | "what breaks if I change this file" |
+| `get_chunk` | full text of one result |
+| `reindex_path` | make a file you just wrote searchable immediately |
+| `list_repos` | which repositories a project covers |
+| `index_status` | what is indexed, how fresh, and whether a rebuild is pending |
+
+Those split into two indexes that answer different kinds of question. The
+**semantic** index (embeddings, plus an LLM-written summary of every file)
+finds code by what it is *about*. The **structural** index (ctags symbol
+definitions and an import graph) answers exact relations — what calls this,
+what depends on this — which similarity search fundamentally cannot. The
+structural half needs no LLM and no embeddings.
+
+Everything runs on your machine. Ollama is used **only** for embeddings and
+for the offline file summaries; generation for your actual questions stays
+with whatever Claude model the Claude Code session is already using.
+Nothing leaves the host.
 
 ## How it works
 
 ```
 +----------------+        MCP / JSON-RPC over HTTP        +-------------------------+
-|  Claude Code   | --------- search_code, etc. ---------> |  Kiss / Tomcat server   |
+|  Claude Code   | ------ search_code / find_symbol ----> |  Kiss / Tomcat server   |
 |  CLI session   | <----- hits: path + lines + score ---- |  /rag-mcp/<project>     |
 +----------------+                                         +-----------+-------------+
                                                                        |
@@ -33,8 +49,10 @@ already using. Nothing leaves the host.
                                    v                   |  one schema per project       |
                        +------------------------+      |    <project>.rag_file         |
                        |  RAG indexer (Groovy)  | ---> |    <project>.rag_chunk        |
-                       |  walk → chunk → embed  |      |    <project>.rag_meta         |
-                       +-----+-------------+----+      |  + pgvector HNSW index        |
+                       |  walk → chunk → embed  |      |    <project>.rag_commit       |
+                       +-----+-------------+----+      |    <project>.rag_def / _dep   |
+                                                       |    <project>.rag_meta         |
+                                                       |  + pgvector HNSW index        |
                              |             |           +-------------------------------+
                              |             v
                              |     +---------------+
@@ -68,16 +86,28 @@ already using. Nothing leaves the host.
 5. Chunks land in pgvector via `INSERT ... ON CONFLICT DO UPDATE`, with
    per-file rollback on failure and a per-N-files commit (default 50).
 
-**Read path** (MCP server):
+**Read path** (MCP server) — `search_code` is a hybrid of three retrievers,
+not a single vector lookup:
 1. Claude Code POSTs to `http://127.0.0.1:17080/rag-mcp/<project>` with an
    MCP `tools/call` envelope (`X-RAG-Token` header for auth).
-2. The query string is embedded by Ollama using the same model used at
-   index time.
-3. pgvector's HNSW cosine-distance search returns the top-K most similar
-   chunks (`ef_search=400`).
-4. Each hit comes back with `chunk_id`, `repo`, `path`, `absolute_path`,
-   `start_line`, `end_line`, `symbol`, `score`, and a `snippet`. Claude
-   normally calls `Read` next on the absolute path / line range.
+2. The query is embedded by Ollama using the model used at index time.
+3. Three retrievals run over the same filtered corpus:
+   - **dense** — pgvector HNSW cosine over chunk embeddings (`ef_search=400`),
+   - **lexical** — a GIN index over identifier-aware lexemes, which splits
+     `camelCase` and `snake_case` so exact symbols still win,
+   - **summary** — cosine over the LLM-written one-paragraph summary of each
+     file, which is prose and therefore matches prose questions directly.
+4. The three are fused with Reciprocal Rank Fusion, then reranked with cheap
+   structural signals (symbol/filename overlap, a per-file diversity cap).
+5. Results are returned as ranked **files** by default, each with the symbols
+   that matched and an excerpt already widened to the whole enclosing
+   function — so one call usually answers the question without a follow-up
+   `Read`. Pass `granularity=chunk` for individual chunks.
+
+Why three legs: the dominant failure mode was never the similarity math, it
+was that the words people search with are often absent from the code being
+searched. The summary leg puts those words into the index; the lexical leg
+covers the opposite case, where you know the exact identifier.
 
 ## Multi-project isolation
 

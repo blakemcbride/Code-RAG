@@ -210,6 +210,53 @@ hand.
 
 ## 6. Day-to-day operations
 
+### The optional passes (beyond indexing)
+
+`./bld scan` keeps the semantic index current on its own. Three further
+passes add capability; each is independent, and the system works without
+any of them.
+
+```bash
+./bld defs all         # ctags symbol definitions   -> find_symbol      (seconds)
+./bld deps all         # import graph               -> find_dependents  (seconds)
+./bld history all      # git + svn commit messages  -> search_history   (minutes)
+./bld summarize all    # one LLM summary per file   -> better search_code (HOURS, GPU-bound)
+```
+
+`defs` and `deps` cost nothing but CPU and are re-run automatically after
+any sweep that changed files. `history` is incremental after the first
+import. `summarize` is the expensive one — roughly a second per file, so
+budget ~4 hours for a 12k-file tree — but it is also the single biggest
+retrieval improvement available, and afterwards the cron sweep tops up
+only the files that changed.
+
+Add `--symbols` to `summarize` for per-symbol summaries of large files
+(slower again; worth it only where single files run to hundreds of chunks).
+
+### Is it actually being used?
+
+```bash
+./bld usage all
+```
+
+Reads the query log and reports searches per day, how often a result was
+actually opened, zero-result queries, and your most frequent searches.
+Retrieval scores say the tool *can* find things; this says whether Claude
+Code is asking it to. If searches stay at zero, fix the routing block in
+`<root>/CLAUDE.local.md` before tuning anything.
+
+### Measure retrieval quality
+
+```bash
+./bld eval <project> --granularity file      # score against eval/<project>-queries.jsonl
+./bld eval <project> --baseline              # record this run as the comparison point
+python3 eval/mine.py <project>               # build query-set candidates from real usage
+```
+
+`eval` diffs against `eval/baseline.json` and prints per-query rank
+movements, so a change that helps on average while breaking five specific
+queries is visible rather than averaged away.
+
 ### Check status
 
 ```bash
@@ -442,6 +489,8 @@ continues. Look at the log line to see which file.
 |---|---|
 | Database | `code_rag` (PostgreSQL local) |
 | Per-project schema | `code_rag.<project>.rag_file` / `rag_chunk` / `rag_meta` |
+| Optional tables | `rag_commit` (history), `rag_def` (ctags), `rag_dep` (imports), `rag_symbol`, `rag_query_log` |
+| Schema version | `<project>.rag_meta.schema_version` — migrations run automatically at startup |
 | Embedding model | `nomic-embed-text:v1.5` (Ollama) |
 | Tomcat port | `17080` (localhost only) |
 | MCP URL | `http://127.0.0.1:17080/rag-mcp/<project>` |
@@ -451,5 +500,8 @@ continues. Look at the log line to see which file.
 | Cron schedule | `src/main/backend/CronTasks/crontab` (every 10 min by default) |
 | Logs | `tomcat/logs/catalina.out` |
 | Indexer code | `src/main/backend/scripts/RAGIndexer.groovy` |
+| Retrieval code | `src/main/precompiled/org/kissweb/rag/RAGSearch.java` |
+| Eval harnesses | `eval/` (`./bld eval`, `eval/turns.py`, `eval/mine.py`) |
 | MCP server code | `src/main/precompiled/org/kissweb/rag/RAGMCPServer.java` |
 | Plans | [RAGPlan.md](RAGPlan.md) |
+| Measured results + rejected ideas | [RAGImprovementPlan.md](RAGImprovementPlan.md) |
