@@ -6,6 +6,7 @@ import org.kissweb.database.Connection
 import org.kissweb.database.Record
 import org.kissweb.json.JSONArray
 import org.kissweb.json.JSONObject
+import org.kissweb.restServer.GroovyService
 import org.kissweb.restServer.MainServlet
 
 import java.net.HttpURLConnection
@@ -129,6 +130,12 @@ class RAGIndexer {
     // embedBatch keeps cumulative request size safe.
     private static final int MAX_CHUNK_CHARS = 1500
 
+    // Upper bound on the context header prepended to each chunk before
+    // embedding. 1500 chars of body is well inside nomic's budget, so this
+    // rides along for free and MAX_CHUNK_CHARS does not need to shrink —
+    // which also means chunk boundaries are unchanged by the header.
+    private static final int EMBED_HEADER_MAX_CHARS = 200
+
     // ----- Public entry points ------------------------------------------------
     //
     // Callers from other backend Groovy files reach these via
@@ -149,20 +156,240 @@ class RAGIndexer {
         return doSweep(db, project, false)
     }
 
+    /**
+     * Populate the import graph for files already indexed, without re-embedding.
+     *
+     * Extraction normally happens inside indexOneFile, so it is free and always
+     * current. This exists only to backfill projects indexed before the import
+     * graph existed: it re-reads files and parses imports, but touches no
+     * embeddings and no GPU.
+     *
+     * params: { project }
+     */
+    static JSONObject backfillDepsJson(Connection db, JSONObject params) {
+        String project = params.getString("project", null)
+        if (!org.kissweb.rag.ProjectRegistry.isValidName(project))
+            throw new RuntimeException("Invalid project name: ${project}")
+        Config cfg = loadConfig(project)
+        Map<String, RootDir> byRepo = [:]
+        for (RootDir r : cfg.roots)
+            byRepo[r.repo] = r
+
+        long t0 = System.currentTimeMillis()
+        int done = 0, skipped = 0
+        List<Record> rows = db.fetchAll(
+                "SELECT file_id, repo, path, language FROM ${project}.rag_file ORDER BY file_id".toString())
+        for (Record r : rows) {
+            RootDir root = byRepo[r.getString("repo")]
+            if (root == null) {
+                skipped++
+                continue
+            }
+            String lang = r.getString("language")
+            if (importFamily(lang) == null) {
+                skipped++
+                continue
+            }
+            File f = new File(root.path, r.getString("path"))
+            if (!f.isFile()) {
+                skipped++
+                continue
+            }
+            try {
+                storeDeps(db, project, r.getLong("file_id"),
+                          new String(f.bytes, StandardCharsets.UTF_8), lang)
+                done++
+                if (done % 500 == 0)
+                    db.commit()
+            } catch (Exception e) {
+                skipped++
+            }
+        }
+        db.commit()
+
+        Record cnt = db.fetchOne("SELECT count(*) AS n FROM ${project}.rag_dep".toString())
+        JSONObject out = new JSONObject()
+        out.put("project", project)
+        out.put("filesScanned", done)
+        out.put("skipped", skipped)
+        out.put("edges", cnt == null ? 0L : cnt.getLong("n"))
+        out.put("elapsedSec", (System.currentTimeMillis() - t0) / 1000L)
+        logger.info("RAGIndexer[${project}] dep backfill: ${done} files, ${out.getLong('edges',0L)} edges")
+        return out
+    }
+
+    /**
+     * Re-index a handful of specific files immediately.
+     *
+     * The background sweep runs every few minutes, which leaves a window where
+     * an agent has just written code and cannot find it — precisely when it is
+     * most likely to look. This closes that window without the cost of a full
+     * sweep: only the named paths are hashed, chunked and embedded.
+     *
+     * Accepts absolute paths, or paths relative to any configured root. Paths
+     * outside every root are reported as skipped rather than indexed, so this
+     * cannot be used to pull arbitrary files into the index.
+     *
+     * params: { project, paths: [...] }
+     */
+    static JSONObject reindexPathsJson(Connection db, JSONObject params) {
+        String project = params.getString("project", null)
+        if (!org.kissweb.rag.ProjectRegistry.isValidName(project))
+            throw new RuntimeException("Invalid project name: ${project}")
+        org.kissweb.json.JSONArray arr = params.getJSONArray("paths")
+        Config cfg = loadConfig(project)
+        verifyMetaMatches(db, cfg, false)
+
+        SweepStats stats = new SweepStats()
+        List<String> indexed = [], skipped = []
+        for (int i = 0; i < arr.length(); i++) {
+            String raw = arr.getString(i)
+            if (raw == null || raw.trim().isEmpty())
+                continue
+            File f = resolveUnderRoots(cfg, raw.trim())
+            if (f == null) {
+                skipped.add(raw + " (not under any configured root, or missing)")
+                continue
+            }
+            RootDir owner = ownerRoot(cfg, f)
+            String rel = owner.path.toPath().relativize(f.toPath()).toString()
+            if (matchesExcluded(f.toPath(), cfg.excludes)) {
+                skipped.add(rel + " (excluded)")
+                continue
+            }
+            if (f.length() > cfg.maxFileBytes) {
+                skipped.add(rel + " (over RAGMaxFileBytes)")
+                continue
+            }
+            try {
+                // Pass null for existingRow: indexOneFile then treats it as new
+                // and its upsert replaces any prior row for this (repo, path).
+                indexOneFile(db, cfg, owner, f, rel, languageOf(f.toPath()), f.length(), null, stats)
+                indexed.add(rel)
+            } catch (Exception e) {
+                skipped.add(rel + " (failed: ${e.message})")
+                try { db.rollback() } catch (Exception ignored) { }
+            }
+        }
+        db.commit()
+
+        // Keep the structural index in step with the chunk index, or find_symbol
+        // would not see a function the agent just wrote.
+        int defs = 0
+        try {
+            List<Long> ids = []
+            List<String> abs = []
+            for (String rel : indexed) {
+                Record fr = db.fetchOne(
+                        "SELECT file_id, repo FROM ${project}.rag_file WHERE path = ?".toString(), rel)
+                if (fr == null)
+                    continue
+                RootDir owner = cfg.roots.find { it.repo == fr.getString("repo") }
+                if (owner == null)
+                    continue
+                ids.add(fr.getLong("file_id"))
+                abs.add(new File(owner.path, rel).absolutePath)
+            }
+            // Single JSONObject argument: Kiss resolves cross-file Groovy
+            // methods by the runtime types of the trailing varargs, and each
+            // extra parameter is another chance for that binding to break.
+            JSONObject dp = new JSONObject()
+            dp.put("project", project)
+            JSONArray ja = new JSONArray()
+            for (Long id : ids)
+                ja.put(id)
+            JSONArray pa = new JSONArray()
+            for (String a : abs)
+                pa.put(a)
+            dp.put("fileIds", ja)
+            dp.put("absPaths", pa)
+            JSONObject dres = (JSONObject) GroovyService.run(
+                    "scripts", "RAGDefs", "ingestFilesJson", null, db, dp)
+            defs = dres.getInt("definitions", 0)
+        } catch (Exception e) {
+            logger.warn("RAGIndexer[${project}] reindexPaths: def refresh failed: ${e.message}")
+        }
+
+        JSONObject out = new JSONObject()
+        out.put("project", project)
+        out.put("definitions", defs)
+        out.put("indexed", indexed.size())
+        out.put("chunks", stats.chunksInserted)
+        out.put("skipped", skipped.size())
+        org.kissweb.json.JSONArray ia = new org.kissweb.json.JSONArray()
+        for (String s : indexed)
+            ia.put(s)
+        out.put("indexedPaths", ia)
+        org.kissweb.json.JSONArray sa = new org.kissweb.json.JSONArray()
+        for (String s : skipped)
+            sa.put(s)
+        out.put("skippedPaths", sa)
+        logger.info("RAGIndexer[${project}] reindexPaths: ${indexed.size()} indexed, ${skipped.size()} skipped")
+        return out
+    }
+
+    /** Resolve a path (absolute or root-relative) to an existing file under a root. */
+    private static File resolveUnderRoots(Config cfg, String raw) {
+        File abs = new File(raw)
+        if (abs.isAbsolute()) {
+            return (abs.isFile() && ownerRoot(cfg, abs) != null) ? abs.canonicalFile : null
+        }
+        for (RootDir r : cfg.roots) {
+            File cand = new File(r.path, raw)
+            if (cand.isFile())
+                return cand.canonicalFile
+        }
+        return null
+    }
+
+    /** The configured root containing this file, or null. */
+    private static RootDir ownerRoot(Config cfg, File f) {
+        String p = f.canonicalPath
+        for (RootDir r : cfg.roots) {
+            String rp = r.path.canonicalPath
+            if (p.startsWith(rp.endsWith("/") ? rp : rp + "/"))
+                return r
+        }
+        return null
+    }
+
     static SweepStats runFullRebuild(Connection db, String project) {
         if (!org.kissweb.rag.ProjectRegistry.isValidName(project))
             throw new RuntimeException("Invalid project name: " + project)
         logger.info("RAGIndexer[${project}]: full rebuild — truncating rag_chunk and rag_file")
         db.execute("TRUNCATE ${project}.rag_chunk, ${project}.rag_file RESTART IDENTITY".toString())
+        // Mark the index as incomplete for the duration. Between the TRUNCATE
+        // and the end of the sweep the index is partial, and a rebuild can be
+        // interrupted (server restart, kill) — clearing the flag up front left
+        // a silently half-populated index that looked healthy. The flag is
+        // cleared only once the sweep actually finishes.
+        db.execute("""
+            INSERT INTO ${project}.rag_meta(key, value) VALUES ('rebuild_required', ?)
+            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+        """.toString(), "full rebuild in progress — interrupted before completion")
         db.commit()
-        return doSweep(db, project, true)
+        SweepStats stats = doSweep(db, project, true)
+        db.execute("DELETE FROM ${project}.rag_meta WHERE key = 'rebuild_required'".toString())
+        db.commit()
+        return stats
     }
 
     // ----- Sweep orchestration ------------------------------------------------
 
     private static SweepStats doSweep(Connection db, String project, boolean fullRebuild) {
         Config cfg = loadConfig(project)
-        verifyMetaMatches(db, cfg)
+        verifyMetaMatches(db, cfg, fullRebuild)
+        // A schema migration that added columns the indexer must populate
+        // leaves existing rows stale. An incremental sweep only revisits files
+        // whose sha256 changed, so it would silently leave most rows unfilled;
+        // refuse until the caller asks for a full rebuild (which clears it).
+        if (!fullRebuild) {
+            Record rr = db.fetchOne(
+                    "SELECT value FROM ${project}.rag_meta WHERE key = 'rebuild_required'".toString())
+            if (rr != null && rr.getString("value") != null && !rr.getString("value").isEmpty())
+                throw new RuntimeException("Project '${project}' needs a full rebuild " +
+                        "(${rr.getString("value")}). Run: ./bld scan ${project} --full")
+        }
         SweepStats stats = new SweepStats()
         long t0 = System.currentTimeMillis()
 
@@ -295,8 +522,13 @@ class RAGIndexer {
             stats.filesSkipped++
             return
         }
-        // Chunker now enforces MAX_CHUNK_CHARS; embed full content directly.
-        List<String> texts = chunks.collect { it.content }
+        // Embed a context-decorated form of each chunk, not the bare body. A
+        // chunk is often a single method with no indication of which file or
+        // class it came from; the header supplies exactly the vocabulary a
+        // natural-language query uses ("where does the OAuth token servlet...").
+        // rag_chunk.content still stores the RAW body — the header is retrieval
+        // scaffolding, not something a reader should get back.
+        List<String> texts = chunks.collect { buildEmbedText(root, relPath, language, it) }
         List<float[]> vectors = embedBatch(cfg, texts)
         if (vectors.size() != chunks.size())
             throw new RuntimeException("Embedding count mismatch: got ${vectors.size()} for ${chunks.size()} chunks in ${file}")
@@ -326,11 +558,21 @@ class RAGIndexer {
         for (int i = 0; i < chunks.size(); i++) {
             Chunk c = chunks[i]
             String vecLit = vectorToLiteral(vectors[i])
+            // lexemes feeds the generated lexemes_tsv column used by hybrid
+            // search. Built from path + symbol + body so an identifier can be
+            // matched literally, by its parts, or by the file it lives in.
+            String lex = buildLexemes(root, relPath, c)
             db.execute(
-                    "INSERT INTO ${proj}.rag_chunk (file_id, chunk_no, start_line, end_line, symbol, content, token_est, embedding) ".toString() +
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?::vector)",
-                    fileId, i, c.startLine, c.endLine, c.symbol, c.content, estimateTokens(c.content), vecLit)
+                    "INSERT INTO ${proj}.rag_chunk (file_id, chunk_no, start_line, end_line, symbol, content, token_est, lexemes, sym_start_line, sym_end_line, embedding) ".toString() +
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?::vector)",
+                    fileId, i, c.startLine, c.endLine, c.symbol, c.content, estimateTokens(c.content), lex,
+                    c.symStartLine, c.symEndLine, vecLit)
             stats.chunksInserted++
+        }
+        try {
+            storeDeps(db, proj, fileId, content, language)
+        } catch (Exception e) {
+            logger.warn("RAGIndexer[${proj}] dep extraction failed for ${relPath}: ${e.message}")
         }
         stats.filesIndexed++
         // Kiss Connection runs with autoCommit=false. Commit every commitBatch
@@ -338,6 +580,163 @@ class RAGIndexer {
         // an fsync per file. 0 means "commit only at the end of the sweep".
         if (cfg.commitBatch > 0 && (stats.filesIndexed % cfg.commitBatch) == 0)
             db.commit()
+    }
+
+    // ----- Import graph -------------------------------------------------------
+
+    /**
+     * Import/require/include statements, by language family.
+     *
+     * Group 1 must be the imported target. These are deliberately anchored to
+     * the start of a line: an "import" inside a string or comment is not a
+     * dependency, and anchoring removes most of those without needing a parser.
+     */
+    private static final Map<String, java.util.regex.Pattern> IMPORT_RE = [
+            // import a.b.C;  /  import static a.b.C.d;  /  import a.b.*
+            'jvm'    : ~/^\s*import\s+(?:static\s+)?([A-Za-z_][\w.]*(?:\.\*)?)\s*;?/,
+            // import x from 'y' / import 'y' / require('y') / from 'y'
+            'js'     : ~/^\s*(?:import\s+(?:[^'"]*\sfrom\s+)?|.*\brequire\s*\()\s*['"]([^'"]+)['"]/,
+            // import a.b  /  from a.b import c
+            'python' : ~/^\s*(?:from\s+([\w.]+)\s+import|import\s+([\w.]+))/,
+            // #include <x> or "x"
+            'c'      : ~/^\s*#\s*include\s*[<"]([^>"]+)[>"]/,
+            // require 'x' / require_relative 'x'
+            'ruby'   : ~/^\s*require(?:_relative)?\s+['"]([^'"]+)['"]/,
+            // use A\B\C;
+            'php'    : ~/^\s*use\s+([\\\w]+)\s*;/,
+            // Go: "path" inside an import block, or import "path"
+            'go'     : ~/^\s*(?:import\s+)?(?:[\w.]+\s+)?"([^"]+)"\s*$/,
+    ]
+
+    /** Which regex family a language uses, or null when we do not track imports for it. */
+    private static String importFamily(String language) {
+        switch (language) {
+            case 'java': case 'groovy': case 'kotlin': case 'scala': return 'jvm'
+            case 'javascript': case 'typescript': return 'js'
+            case 'python': return 'python'
+            case 'c': case 'cpp': case 'objc': return 'c'
+            case 'ruby': return 'ruby'
+            case 'php': return 'php'
+            case 'go': return 'go'
+            default: return null
+        }
+    }
+
+    /**
+     * Record what this file imports. Replaces the file's previous rows, so a
+     * removed import disappears rather than lingering.
+     */
+    private static void storeDeps(Connection db, String proj, long fileId,
+                                  String content, String language) {
+        db.execute("DELETE FROM ${proj}.rag_dep WHERE file_id = ?".toString(), fileId)
+        String fam = importFamily(language)
+        if (fam == null)
+            return
+        java.util.regex.Pattern re = IMPORT_RE[fam]
+        String[] lines = content.split("\n", -1)
+        Set<String> seen = new HashSet<>()
+        int lineNo = 0
+        for (String line : lines) {
+            lineNo++
+            // Imports live at the top of a file; scanning the whole thing just
+            // invites false positives from strings and generated code.
+            if (lineNo > 400)
+                break
+            def m = re.matcher(line)
+            if (!m.find())
+                continue
+            String target = m.group(1)
+            if (target == null && m.groupCount() >= 2)
+                target = m.group(2)
+            if (target == null || target.isEmpty())
+                continue
+            // "import a.b.*;" leaves a trailing dot once the star is consumed;
+            // a package wildcard is still a real dependency on that package.
+            target = target.trim()
+            while (target.endsWith(".") || target.endsWith("*") || target.endsWith("\\"))
+                target = target.substring(0, target.length() - 1)
+            if (target.isEmpty())
+                continue
+            if (target.length() > 300 || !seen.add(target))
+                continue
+            db.execute(
+                    ("INSERT INTO ${proj}.rag_dep (file_id, target, target_tail, kind, line) " +
+                     "VALUES (?,?,?,?,?) ON CONFLICT (file_id, target, line) DO NOTHING").toString(),
+                    fileId, target, importTail(target), fam, lineNo)
+        }
+    }
+
+    /**
+     * The part of an import target that identifies a file: the class name for a
+     * dotted JVM import, the basename for a path-like one. Lowercased, since
+     * this is matched against file basenames case-insensitively.
+     */
+    static String importTail(String target) {
+        String t = target
+        if (t.endsWith(".*"))
+            t = t.substring(0, t.length() - 2)
+        int cut = Math.max(Math.max(t.lastIndexOf('.'), t.lastIndexOf('/')), t.lastIndexOf('\\'))
+        if (cut >= 0 && cut < t.length() - 1)
+            t = t.substring(cut + 1)
+        return t.toLowerCase()
+    }
+
+    // ----- Embed text and lexemes ---------------------------------------------
+
+    /**
+     * Build the text actually sent to the embedding model: a short provenance
+     * header followed by the raw chunk body.
+     *
+     * The header exists because a bare chunk carries none of the vocabulary a
+     * person uses when searching. A 20-line method body says {@code tryAcquireLock}
+     * but nothing about being in {@code RAGAdmin.groovy}, nothing about the
+     * project, nothing about the language. Queries are written in exactly that
+     * missing vocabulary.
+     *
+     * The stored {@code rag_chunk.content} is unaffected — callers get the raw
+     * body back, not this.
+     */
+    static String buildEmbedText(RootDir root, String relPath, String language, Chunk c) {
+        StringBuilder h = new StringBuilder(EMBED_HEADER_MAX_CHARS + 8)
+        h.append("repo: ").append(root.repo).append('\n')
+        h.append("file: ").append(relPath).append('\n')
+        if (language != null && !language.isEmpty())
+            h.append("lang: ").append(language).append('\n')
+        if (c.symbol != null && !c.symbol.isEmpty())
+            h.append("symbol: ").append(c.symbol).append('\n')
+        String header = h.toString()
+        // Defensive: a pathological path could blow the budget. Truncate the
+        // header rather than the body — the body is the thing being indexed.
+        if (header.length() > EMBED_HEADER_MAX_CHARS)
+            header = header.substring(0, EMBED_HEADER_MAX_CHARS) + "\n"
+        return header + "---\n" + c.content
+    }
+
+    /**
+     * Build the lexical index text for one chunk: path components, the symbol,
+     * and the body, all run through {@link #tokenizeForSearch}.
+     *
+     * Stored in rag_chunk.lexemes; the generated lexemes_tsv column turns it
+     * into a tsvector for the lexical leg of hybrid search.
+     */
+    static String buildLexemes(RootDir root, String relPath, Chunk c) {
+        StringBuilder src = new StringBuilder()
+        src.append(root.repo).append(' ')
+        src.append(relPath).append(' ')
+        if (c.symbol != null && !c.symbol.isEmpty())
+            src.append(c.symbol).append(' ')
+        src.append(c.content)
+        return tokenizeForSearch(src.toString())
+    }
+
+    /**
+     * Tokenize for the lexical index. Delegates to the precompiled
+     * {@link org.kissweb.rag.RAGTokenizer} so that indexing and querying can
+     * never drift apart — a divergence there would silently disable the
+     * lexical leg of hybrid search rather than fail loudly.
+     */
+    static String tokenizeForSearch(String s) {
+        return org.kissweb.rag.RAGTokenizer.tokenize(s)
     }
 
     // ----- Chunking -----------------------------------------------------------
@@ -487,7 +886,14 @@ class RAGIndexer {
             String body = sliceLines(lines, s, e)
             if (body.trim().isEmpty())
                 continue
-            out.addAll(splitLargeChunk(body, s + 1, e + 1, symbol))
+            List<Chunk> parts = splitLargeChunk(body, s + 1, e + 1, symbol)
+            // Stamp every fragment with the range of the whole symbol, so a hit
+            // on one fragment of a long method can be returned as the method.
+            for (Chunk c : parts) {
+                c.symStartLine = s + 1
+                c.symEndLine = e + 1
+            }
+            out.addAll(parts)
         }
         return out
     }
@@ -553,20 +959,42 @@ class RAGIndexer {
         return out
     }
 
+    /** Per-chunk character budget, overridable via RAGMaxChunkChars. */
+    private static int maxChunkChars() {
+        try {
+            String v = MainServlet.getEnvironment("RAGMaxChunkChars")
+            if (v != null && !v.isEmpty()) {
+                int n = Integer.parseInt(v)
+                if (n >= 200)
+                    return n
+            }
+        } catch (Exception ignored) { /* fall through to default */ }
+        return MAX_CHUNK_CHARS
+    }
+
     /**
-     * Enforce MAX_CHUNK_CHARS by recursively halving the body until each piece
-     * fits. Lines are kept together when possible — we halve at line boundaries
-     * for everything that has more than one line. A single oversize line (rare:
-     * minified JS, embedded SQL strings) is sliced by character offset; we lose
-     * line-fidelity inside such lines but they were not really lines anyway.
+     * Enforce the per-chunk character budget by recursively splitting the body
+     * until each piece fits.
+     *
+     * The split point is chosen semantically rather than at the blind midpoint:
+     * a cut through the middle of an expression produces two fragments that
+     * each embed poorly, whereas a cut at a blank line between statements — at
+     * the shallowest brace depth available — yields pieces that are each
+     * coherent. We search a window around the midpoint so the split stays
+     * roughly balanced and recursion still terminates.
+     *
+     * A single oversize line (minified JS, a long embedded SQL string) is
+     * sliced by character offset; we lose line-fidelity inside such lines, but
+     * they were never really lines.
      */
     private static List<Chunk> splitLargeChunk(String body, int startLine, int endLine, String symbol) {
-        if (body.length() <= MAX_CHUNK_CHARS)
+        int cap = maxChunkChars()
+        if (body.length() <= cap)
             return [new Chunk(content: body, startLine: startLine, endLine: endLine, symbol: symbol)]
 
         String[] sub = body.split("\n", -1)
         if (sub.length > 1) {
-            int mid = Math.max(1, sub.length.intdiv(2))
+            int mid = chooseSplitLine(sub)
             String top = sliceLines(sub, 0, mid - 1)
             String bot = sliceLines(sub, mid, sub.length - 1)
             List<Chunk> out = []
@@ -579,12 +1007,71 @@ class RAGIndexer {
         List<Chunk> out = []
         int i = 0
         while (i < body.length()) {
-            int end = Math.min(i + MAX_CHUNK_CHARS, body.length())
+            int end = Math.min(i + cap, body.length())
             out.add(new Chunk(content: body.substring(i, end),
                               startLine: startLine, endLine: endLine, symbol: symbol))
             i = end
         }
         return out
+    }
+
+    /**
+     * Pick the line index to split at, within the central half of the block so
+     * the two halves stay comparable in size and the recursion converges.
+     *
+     * Preference order, best first:
+     *   1. a blank line at the shallowest brace depth seen in the window
+     *      (a statement/paragraph boundary between top-level constructs)
+     *   2. any line at the shallowest depth (start of a new statement)
+     *   3. the midpoint (previous behavior)
+     *
+     * Returns an index in [1, lines.length-1] — never 0 or the length, so both
+     * halves are non-empty.
+     */
+    private static int chooseSplitLine(String[] lines) {
+        int n = lines.length
+        int mid = Math.max(1, n.intdiv(2))
+        int lo = Math.max(1, n.intdiv(4))
+        int hi = Math.min(n - 1, (3 * n).intdiv(4))
+        if (lo >= hi)
+            return mid
+
+        // Brace depth at the START of each line.
+        int[] depth = new int[n]
+        int d = 0
+        for (int i = 0; i < n; i++) {
+            depth[i] = d
+            String s = lines[i]
+            for (int j = 0; j < s.length(); j++) {
+                char c = s.charAt(j)
+                if (c == '{' || c == '(' || c == '[')
+                    d++
+                else if (c == '}' || c == ')' || c == ']')
+                    d--
+            }
+        }
+
+        int minDepth = Integer.MAX_VALUE
+        for (int i = lo; i <= hi; i++)
+            if (depth[i] < minDepth)
+                minDepth = depth[i]
+
+        int bestBlank = -1, bestAny = -1
+        for (int i = lo; i <= hi; i++) {
+            if (depth[i] != minDepth)
+                continue
+            if (bestAny < 0 || Math.abs(i - mid) < Math.abs(bestAny - mid))
+                bestAny = i
+            // A blank line immediately before this one marks a paragraph break.
+            if (lines[i - 1].trim().isEmpty())
+                if (bestBlank < 0 || Math.abs(i - mid) < Math.abs(bestBlank - mid))
+                    bestBlank = i
+        }
+        if (bestBlank > 0)
+            return bestBlank
+        if (bestAny > 0)
+            return bestAny
+        return mid
     }
 
     private static String sliceLines(String[] lines, int startInc, int endInc) {
@@ -763,7 +1250,18 @@ class RAGIndexer {
         return c
     }
 
-    private static void verifyMetaMatches(Connection db, Config cfg) {
+    /**
+     * Guard against indexing new vectors into an index built by a different
+     * model or at a different dimension.
+     *
+     * Dimension mismatch is fatal either way — the column type cannot hold the
+     * vectors. Model mismatch is subtler and more dangerous: the INSERTs would
+     * succeed and the index would quietly contain vectors from two models,
+     * which are not comparable, degrading recall with no error anywhere. So an
+     * incremental sweep refuses; a full rebuild is exactly the operation that
+     * makes it safe, and adopts the new model.
+     */
+    private static void verifyMetaMatches(Connection db, Config cfg, boolean fullRebuild) {
         Record rec = db.fetchOne(
                 "SELECT value FROM ${cfg.project}.rag_meta WHERE key = 'embedding_dim'".toString())
         if (rec == null)
@@ -771,7 +1269,24 @@ class RAGIndexer {
         int storedDim = Integer.parseInt(rec.getString("value"))
         if (storedDim != cfg.embeddingDim)
             throw new RuntimeException("Embedding dim mismatch for '${cfg.project}': " +
-                    "application.ini=${cfg.embeddingDim}, rag_meta=${storedDim}. Rebuild required.")
+                    "application.ini=${cfg.embeddingDim}, rag_meta=${storedDim}. " +
+                    "Changing dimension requires dropping and re-creating the schema.")
+
+        Record mrec = db.fetchOne(
+                "SELECT value FROM ${cfg.project}.rag_meta WHERE key = 'embedding_model'".toString())
+        String storedModel = (mrec != null) ? mrec.getString("value") : null
+        if (storedModel != null && storedModel != cfg.embeddingModel) {
+            if (!fullRebuild)
+                throw new RuntimeException("Embedding model mismatch for '${cfg.project}': " +
+                        "application.ini=${cfg.embeddingModel}, index was built with ${storedModel}. " +
+                        "Vectors from different models are not comparable. " +
+                        "Run: ./bld scan ${cfg.project} --full")
+            logger.warn("RAGIndexer[${cfg.project}]: full rebuild adopting new embedding model " +
+                    "${storedModel} -> ${cfg.embeddingModel}")
+            db.execute("UPDATE ${cfg.project}.rag_meta SET value = ? WHERE key = 'embedding_model'".toString(),
+                    cfg.embeddingModel)
+            db.commit()
+        }
     }
 
     private static String env(String key, String dflt) {
@@ -865,6 +1380,14 @@ class RAGIndexer {
         int startLine
         int endLine
         String symbol
+        /**
+         * Line range of the ENCLOSING symbol, which may span several chunks
+         * when a large method had to be split. Equals startLine/endLine for a
+         * symbol that fit in one chunk, and 0 when the chunk came from the
+         * fixed-window chunker (no symbol structure to speak of).
+         */
+        int symStartLine
+        int symEndLine
     }
 
     static class SweepStats {

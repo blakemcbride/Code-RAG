@@ -1,6 +1,7 @@
 {
   "_comment": "Edit this file to declare your projects. Each project becomes a PostgreSQL schema (in the code_rag database) and is exposed at /rag-mcp/<name> for MCP-capable agents (Claude Code, OpenAI Codex CLI, etc.). Restart the server after editing so the schema is bootstrapped.",
   "_comment_project_dir": "Optional 'project_dir' is an umbrella directory ABOVE the roots — typically where you launch 'claude'. bld writes a second .mcp.json there (so the MCP tool is visible from the umbrella) and a CLAUDE.md routing snippet (so Claude Code prefers search_code for conceptual queries). It is NOT indexed; only 'roots' get scanned.",
+  "_comment_excludes": "'excludeGlobs' is ADDED to the built-in base excludes (ProjectRegistry.BASE_EXCLUDES), not substituted for them — so you never need to re-list node_modules/.git/target/build/dist/minified assets/generated jsdoc/IDE state. List only what is specific to your tree. Globs are matched against ABSOLUTE paths, so prefix them with '**/'. Beware over-broad directory names: '**/vendor/**' looks safe but silently deletes application source in any codebase where 'vendor' is a domain word (a supplier). After changing excludes, run './bld scan <project>' — an incremental sweep deletes newly-excluded files, no full rebuild needed.",
 
   "projects": [
     {
@@ -11,12 +12,8 @@
         "/path/to/your/umbrella/sub-repo-2"
       ],
       "excludeGlobs": [
-        "**/node_modules", "**/node_modules/**",
-        "**/.git", "**/.git/**",
-        "**/build", "**/build/**",
-        "**/target", "**/target/**",
-        "**/dist", "**/dist/**",
-        "**/*.jar"
+        "**/generated-sources/**",
+        "**/sub-repo-1/thirdparty/**"
       ]
     }
   ]

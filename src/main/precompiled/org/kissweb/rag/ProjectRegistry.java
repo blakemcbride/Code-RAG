@@ -37,16 +37,74 @@ public final class ProjectRegistry {
 
     private static final Pattern NAME_RE = Pattern.compile("[a-z][a-z0-9_]*");
 
-    /** Fallback excludes when a project entry omits excludeGlobs. */
-    private static final List<String> DEFAULT_EXCLUDES = Collections.unmodifiableList(Arrays.asList(
-            "**/node_modules", "**/node_modules/**",
-            "**/work", "**/work/**",
-            "**/target", "**/target/**",
+    /**
+     * Excludes applied to <b>every</b> project, always. A project's own
+     * {@code excludeGlobs} are added to these, not substituted for them.
+     * <br><br>
+     * That distinction matters: the earlier behavior was "replace", so the
+     * moment a project declared a single extra exclusion it silently lost
+     * {@code node_modules}, {@code .git} and the rest, and every project had to
+     * re-list the whole set defensively.
+     * <br><br>
+     * The entries fall into three groups, all of which are machine output or
+     * third-party code rather than the code being searched:
+     * <ul>
+     *   <li><b>Build output and VCS/IDE state</b> — never the answer to a
+     *       question about the codebase.</li>
+     *   <li><b>Vendored and minified assets</b> — actively harmful. Minified
+     *       bundles are token soup that pollutes both the dense and lexical
+     *       retrievers, and they are large: six such files accounted for ~2300
+     *       chunks in one measured project.</li>
+     *   <li><b>Generated API documentation</b> — a verbatim restatement of
+     *       source that is already indexed, so it competes with the real thing.
+     *       Measured on the Kiss tree, {@code manual/jsdoc} alone was 31% of
+     *       the entire index (1941 chunks from 34 files), and
+     *       {@code jsdoc/Utils.html} was 2.2x the size of the {@code Utils.js}
+     *       it documents.</li>
+     * </ul>
+     * Hand-written prose (READMEs, design notes, {@code .tex}/{@code .md}
+     * manual sources) is deliberately <b>not</b> excluded — it carries
+     * rationale that exists nowhere in the code.
+     */
+    private static final List<String> BASE_EXCLUDES = Collections.unmodifiableList(Arrays.asList(
+            // VCS, build output, transient dirs
             "**/.git", "**/.git/**",
-            "**/*.jar",
+            "**/node_modules", "**/node_modules/**",
+            "**/target", "**/target/**",
+            "**/build", "**/build/**",
+            "**/work", "**/work/**",
+            "**/dist", "**/dist/**",
+            "**/out", "**/out/**",
             "**/tomcat", "**/tomcat/**",
-            "**/build", "**/build/**"
+            "**/coverage", "**/coverage/**",
+            // IDE / editor state
+            "**/.idea", "**/.idea/**",
+            "**/.vscode", "**/.vscode/**",
+            // NOTE: "**/vendor/**" is deliberately NOT here. "vendor" is a
+            // common domain word (supplier), and on a real business codebase
+            // that pattern silently dropped 44 files of application source
+            // under services/.../misc/vendor/ while uniquely catching only a
+            // handful of third-party stylesheets — everything else it would
+            // have caught was already matched by the minified-asset patterns
+            // below. Projects with a genuine top-level vendor/ directory
+            // should exclude it explicitly via their own excludeGlobs.
+            // Minified / generated assets and source maps
+            "**/*.min.js", "**/*.min.css",
+            "**/*.min.*.js", "**/*.min.*.css",
+            "**/*.map",
+            // Generated API documentation (duplicates indexed source)
+            "**/jsdoc/**",
+            "**/manual/man/**",
+            // Dependency lockfiles
+            "**/package-lock.json", "**/yarn.lock", "**/pnpm-lock.yaml",
+            // Compiled artifacts and archives
+            "**/*.jar", "**/*.war", "**/*.class", "**/*.zip", "**/*.gz"
     ));
+
+    /** The always-applied exclusion list (read-only). */
+    public static List<String> baseExcludes() {
+        return BASE_EXCLUDES;
+    }
 
     private ProjectRegistry() {
         // utility class
@@ -119,14 +177,15 @@ public final class ProjectRegistry {
             for (int j = 0; j < rootsArr.length(); j++)
                 roots.add(rootsArr.getString(j));
 
-            List<String> excludes;
+            // Base excludes always apply; a project's excludeGlobs ADD to them.
+            List<String> excludes = new ArrayList<>(BASE_EXCLUDES);
             if (obj.has("excludeGlobs")) {
                 JSONArray exArr = obj.getJSONArray("excludeGlobs");
-                excludes = new ArrayList<>(exArr.length());
-                for (int j = 0; j < exArr.length(); j++)
-                    excludes.add(exArr.getString(j));
-            } else {
-                excludes = new ArrayList<>(DEFAULT_EXCLUDES);
+                for (int j = 0; j < exArr.length(); j++) {
+                    String g = exArr.getString(j).trim();
+                    if (!g.isEmpty() && !excludes.contains(g))
+                        excludes.add(g);
+                }
             }
             out.add(new Project(name, roots, excludes));
         }

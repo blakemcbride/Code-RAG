@@ -30,12 +30,20 @@ class KissInit {
         MainServlet.allowWithoutAuthentication("services.RAGAdmin", "reindex")
         MainServlet.allowWithoutAuthentication("services.RAGAdmin", "listProjects")
         MainServlet.allowWithoutAuthentication("services.RAGAdmin", "reconcile")
+        MainServlet.allowWithoutAuthentication("services.RAGAdmin", "eval")
+        MainServlet.allowWithoutAuthentication("services.RAGAdmin", "history")
+        MainServlet.allowWithoutAuthentication("services.RAGAdmin", "summarize")
+        MainServlet.allowWithoutAuthentication("services.RAGAdmin", "reindexPath")
+        MainServlet.allowWithoutAuthentication("services.RAGAdmin", "defs")
+        MainServlet.allowWithoutAuthentication("services.RAGAdmin", "deps")
+        MainServlet.allowWithoutAuthentication("services.RAGAdmin", "usage")
 
         // The Kiss default root logger is at ERROR — bump our RAG namespaces
         // to INFO so sweep-start/done lines, queued requests, and other
         // progress signals are visible in catalina.out.
         Configurator.setLevel(LogManager.getLogger("services.RAGAdmin"), Level.INFO)
         Configurator.setLevel(LogManager.getLogger("scripts.RAGIndexer"), Level.INFO)
+        Configurator.setLevel(LogManager.getLogger("scripts.RAGEval"), Level.INFO)
         Configurator.setLevel(LogManager.getLogger("CronTasks.RAGSweep"), Level.INFO)
         Configurator.setLevel(LogManager.getLogger(KissInit.class), Level.INFO)
 

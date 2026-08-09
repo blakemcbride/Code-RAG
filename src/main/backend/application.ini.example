@@ -23,6 +23,15 @@ DatabaseMaxStatementsPerConnection = 0
 ; Kiss's default of 60s would abort multi-minute reindex jobs.
 DatabaseUnreturnedTimeout = 0
 
+; Recommended: Kiss defaults the max pool to (cores x 4, min 20). On a many-core
+; box that reserves dozens of connections for a tool that serves one agent at a
+; time, and can exhaust PostgreSQL's max_connections (default 100) when another
+; application shares the server — the symptom is "sorry, too many clients
+; already" at startup. Raise these only if you actually see pool contention.
+DatabaseMaxPoolSize     = 16
+DatabaseInitialPoolSize = 4
+DatabaseMinPoolSize     = 2
+
 ; Standard Kiss knobs
 MaxWorkerThreads = 30
 UserInactiveSeconds = 900
@@ -38,6 +47,50 @@ EmbeddingMaxBatchBytes = 6000
 ; pgvector HNSW search depth — higher = better recall, mild query-time cost.
 ; 400 is comfortable up to ~100k chunks; bump to 800 if recall starts to slip.
 HNSWEfSearch = 400
+
+; Hybrid retrieval: search_code fuses a dense (pgvector) and a lexical
+; (identifier-aware tsvector) retrieval with Reciprocal Rank Fusion,
+; score = weight / (RAGRRFConstant + rank). Set RAGHybridWeightLexical = 0
+; for pure dense retrieval.
+; The lexical leg gets a minority vote on purpose: it is much noisier than the
+; dense leg on conceptual queries. Its job is to widen the candidate pool for
+; identifier-shaped queries, not to rank them. Sweep this with ./bld eval on
+; your own corpus — 0.25 was the measured optimum on a ~6k-chunk Java/JS tree.
+RAGHybridWeightDense   = 1.0
+RAGHybridWeightLexical = 0.25
+RAGRRFConstant = 60
+; Candidates pulled from EACH retriever before fusion and reranking.
+RAGOverfetch = 50
+
+; Heuristic rerank applied to the fused pool before truncating to k.
+; Boosts are scaled by how much of the symbol / file name the query accounts
+; for, so a full identifier match earns the whole boost and an incidental
+; single-word overlap earns little. Unscaled boosts measurably hurt.
+RAGBoostSymbol       = 0.60
+RAGBoostPath         = 0.25
+RAGPenaltyBoilerplate = 0.50
+; Max chunks any single file may contribute to the result set (0 = unlimited).
+; Stops one large on-topic file from filling every slot on a cross-file question.
+RAGMaxPerFile = 2
+
+; Per-chunk character budget. Oversize bodies are split at semantic boundaries
+; (blank line at the shallowest brace depth) rather than at the blind midpoint.
+; Changing this requires a full rebuild. Measured on a ~6k-chunk Java/JS tree:
+; 1500 clearly beat 2400 (bigger chunks cost hit@10 0.92 -> 0.86 and
+; recall@10 0.83 -> 0.75), so raise it only with eval evidence.
+RAGMaxChunkChars = 1500
+
+; Max characters when a hit is expanded to its whole enclosing symbol.
+RAGMaxExpandChars = 6000
+
+; Optional second-stage rerank of the candidate pool by a local chat model.
+; Leave COMMENTED OUT to disable — do not write "RAGRerankModel =" with an
+; empty value; Kiss's ini parser throws on a valueless key, which aborts
+; KissInit and leaves every service with a null database connection.
+; Costs seconds per query, which the agent waits on. Measure before enabling.
+; RAGRerankModel = qwen2.5-coder:14b
+RAGRerankTimeoutMs = 2000
+RAGRerankPool = 30
 
 ; ----- Indexer -----
 ; Project roots and exclude globs are per-project in rag-projects.json.

@@ -119,6 +119,301 @@ class RAGAdmin {
     }
 
     /**
+     * Run the retrieval-quality eval for one project against a golden query
+     * set and return the scored report.
+     *
+     * Input:  { "project": "<name>", "queryFile": "<absolute path to .jsonl>" }
+     * Output: the full report from scripts/RAGEval (overall / bySplit / byTag /
+     *         perQuery), or { "error": "..." }.
+     *
+     * Synchronous — the caller (./bld eval) waits. A 50-query set costs one
+     * embedding round trip each, so expect single-digit seconds.
+     */
+    void eval(JSONObject injson, JSONObject outjson, Connection db, ProcessServlet servlet) {
+        String project = injson.getString("project", null)
+        String queryFile = injson.getString("queryFile", null)
+        if (project == null || project.isEmpty()) {
+            outjson.put("error", "project is required")
+            return
+        }
+        if (!ProjectRegistry.isValidName(project) || ProjectRegistry.get(project) == null) {
+            outjson.put("error", "Unknown project: " + project)
+            return
+        }
+        if (queryFile == null || queryFile.isEmpty()) {
+            outjson.put("error", "queryFile is required")
+            return
+        }
+        JSONObject params = new JSONObject()
+        params.put("project", project)
+        params.put("queryFile", queryFile)
+        params.put("granularity", injson.getString("granularity", "chunk"))
+        JSONObject res
+        try {
+            res = (JSONObject) GroovyService.run("scripts", "RAGEval", "runJson", null, db, params)
+        } catch (Exception e) {
+            logger.error("RAGAdmin.eval[${project}] failed", e)
+            outjson.put("error", e.message ?: e.toString())
+            return
+        }
+        for (String k : res.keySet())
+            outjson.put(k, res.get(k))
+    }
+
+    /**
+     * Report how the tool is actually being used.
+     *
+     * Retrieval scores say the tool CAN find things; this says whether anything
+     * is asking it to. That distinction matters most right after the routing
+     * rules were added — if searches per day stays at zero, no amount of
+     * ranking work is reaching Claude Code.
+     *
+     * Input:  { "project": "<name>", "days": <int, default 14> }
+     */
+    void usage(JSONObject injson, JSONObject outjson, Connection db, ProcessServlet servlet) {
+        String project = injson.getString("project", null)
+        if (project == null || !ProjectRegistry.isValidName(project) || ProjectRegistry.get(project) == null) {
+            outjson.put("error", "Unknown or missing project: " + project)
+            return
+        }
+        int days = injson.getInt("days", 14)
+        try {
+            Record tot = db.fetchOne(
+                    ("SELECT count(*) FILTER (WHERE kind='search') AS searches, " +
+                     "       count(*) FILTER (WHERE kind='fetch')  AS fetches, " +
+                     "       count(*) FILTER (WHERE kind='search' AND coalesce(paths,'')='') AS empties, " +
+                     "       coalesce(round(avg(latency_ms) FILTER (WHERE kind='search')),0) AS avg_ms " +
+                     "  FROM ${project}.rag_query_log").toString())
+            outjson.put("project", project)
+            outjson.put("searches", tot.getLong("searches"))
+            outjson.put("fetches", tot.getLong("fetches"))
+            outjson.put("zeroResultSearches", tot.getLong("empties"))
+            outjson.put("avgLatencyMs", tot.getLong("avg_ms"))
+
+            JSONArray daily = new JSONArray()
+            for (Record r : db.fetchAll(
+                    ("SELECT to_char(at::date,'YYYY-MM-DD') AS d, " +
+                     "       count(*) FILTER (WHERE kind='search') AS s, " +
+                     "       count(*) FILTER (WHERE kind='fetch') AS f " +
+                     "  FROM ${project}.rag_query_log " +
+                     " WHERE at > now() - interval '${days} days' " +
+                     " GROUP BY 1 ORDER BY 1 DESC").toString())) {
+                JSONObject o = new JSONObject()
+                o.put("date", r.getString("d"))
+                o.put("searches", r.getLong("s"))
+                o.put("fetches", r.getLong("f"))
+                daily.put(o)
+            }
+            outjson.put("daily", daily)
+
+            JSONArray top = new JSONArray()
+            for (Record r : db.fetchAll(
+                    ("SELECT query, count(*) AS n FROM ${project}.rag_query_log " +
+                     " WHERE kind='search' AND query IS NOT NULL " +
+                     " GROUP BY query ORDER BY n DESC, query LIMIT 10").toString())) {
+                JSONObject o = new JSONObject()
+                o.put("query", r.getString("query"))
+                o.put("count", r.getLong("n"))
+                top.put(o)
+            }
+            outjson.put("topQueries", top)
+        } catch (Exception e) {
+            logger.error("RAGAdmin.usage[${project}] failed", e)
+            outjson.put("error", e.message ?: e.toString())
+        }
+    }
+
+    /**
+     * Backfill the import graph for files indexed before it existed.
+     *
+     * Input:  { "project": "<name>" }
+     */
+    void deps(JSONObject injson, JSONObject outjson, Connection db, ProcessServlet servlet) {
+        String project = injson.getString("project", null)
+        if (project == null || !ProjectRegistry.isValidName(project) || ProjectRegistry.get(project) == null) {
+            outjson.put("error", "Unknown or missing project: " + project)
+            return
+        }
+        JSONObject params = new JSONObject()
+        params.put("project", project)
+        try {
+            JSONObject res = (JSONObject) GroovyService.run(
+                    "scripts", "RAGIndexer", "backfillDepsJson", null, db, params)
+            for (String k : res.keySet())
+                outjson.put(k, res.get(k))
+        } catch (Exception e) {
+            logger.error("RAGAdmin.deps[${project}] failed", e)
+            outjson.put("error", e.message ?: e.toString())
+        }
+    }
+
+    /**
+     * Extract symbol definitions with ctags into rag_def.
+     *
+     * Input:  { "project": "<name>" }
+     */
+    void defs(JSONObject injson, JSONObject outjson, Connection db, ProcessServlet servlet) {
+        String project = injson.getString("project", null)
+        if (project == null || !ProjectRegistry.isValidName(project) || ProjectRegistry.get(project) == null) {
+            outjson.put("error", "Unknown or missing project: " + project)
+            return
+        }
+        JSONObject params = new JSONObject()
+        params.put("project", project)
+        try {
+            JSONObject res = (JSONObject) GroovyService.run("scripts", "RAGDefs", "runJson", null, db, params)
+            for (String k : res.keySet())
+                outjson.put(k, res.get(k))
+        } catch (Exception e) {
+            logger.error("RAGAdmin.defs[${project}] failed", e)
+            outjson.put("error", e.message ?: e.toString())
+        }
+    }
+
+    /**
+     * Re-index specific files immediately (synchronous, small).
+     *
+     * Input:  { "project": "<name>", "paths": ["...", ...] }
+     */
+    void reindexPath(JSONObject injson, JSONObject outjson, Connection db, ProcessServlet servlet) {
+        String project = injson.getString("project", null)
+        if (project == null || !ProjectRegistry.isValidName(project) || ProjectRegistry.get(project) == null) {
+            outjson.put("error", "Unknown or missing project: " + project)
+            return
+        }
+        if (!injson.has("paths")) {
+            outjson.put("error", "paths is required")
+            return
+        }
+        JSONObject params = new JSONObject()
+        params.put("project", project)
+        params.put("paths", injson.getJSONArray("paths"))
+        try {
+            JSONObject res = (JSONObject) GroovyService.run(
+                    "scripts", "RAGIndexer", "reindexPathsJson", null, db, params)
+            for (String k : res.keySet())
+                outjson.put(k, res.get(k))
+        } catch (Exception e) {
+            logger.error("RAGAdmin.reindexPath[${project}] failed", e)
+            outjson.put("error", e.message ?: e.toString())
+        }
+    }
+
+    /**
+     * Index VCS commit history for one project (git and Subversion roots).
+     * Synchronous; incremental after the first run.
+     *
+     * Input:  { "project": "<name>", "maxCommits": <int, optional> }
+     */
+    void history(JSONObject injson, JSONObject outjson, Connection db, ProcessServlet servlet) {
+        String project = injson.getString("project", null)
+        if (project == null || !ProjectRegistry.isValidName(project) || ProjectRegistry.get(project) == null) {
+            outjson.put("started", false)
+            outjson.put("message", "Unknown or missing project: " + project)
+            return
+        }
+        // Async, like reindex and summarize. A first import can be tens of
+        // thousands of commits across several roots; run synchronously it
+        // outlives the HTTP request and Tomcat recycles the response out from
+        // under it ("response object has been recycled").
+        if (!tryAcquireLock(db, project)) {
+            outjson.put("started", false)
+            outjson.put("message", "A sweep, summarize or history run is already active for '${project}'")
+            return
+        }
+        int maxCommits = injson.getInt("maxCommits", 0)
+        logger.info("RAGAdmin.history[${project}] queued")
+        Thread t = new Thread({ ->
+            Connection bgDb = null
+            try {
+                bgDb = backgroundConnection()
+                JSONObject params = new JSONObject()
+                params.put("project", project)
+                params.put("maxCommits", maxCommits)
+                JSONObject res = (JSONObject) GroovyService.run(
+                        "scripts", "RAGHistory", "runJson", null, bgDb, params)
+                bgDb.commit()
+                logger.info("RAGAdmin.history[${project}] finished: " + res.toString())
+            } catch (Throwable e) {
+                logger.error("RAGAdmin.history[${project}] failed", e)
+                try { bgDb?.rollback() } catch (Exception ignored) {}
+            } finally {
+                try { releaseLock(bgDb, project) } catch (Exception ignored) {}
+                try { bgDb?.close() } catch (Exception ignored) {}
+            }
+        } as Runnable, "RAGHistory-" + project)
+        t.setDaemon(true)
+        t.start()
+        outjson.put("started", true)
+        outjson.put("project", project)
+        outjson.put("message", "History indexing started; poll services/RAGAdmin.status")
+    }
+
+    /** A dedicated (non-pooled) connection for a long-running background job. */
+    private static Connection backgroundConnection() {
+        String dbHost = nz(MainServlet.getEnvironment("DatabaseHost"), "localhost")
+        int    dbPort = Integer.parseInt(nz(MainServlet.getEnvironment("DatabasePort"), "5432"))
+        String dbName = (String) MainServlet.getEnvironment("DatabaseName")
+        String dbUser = nz(MainServlet.getEnvironment("DatabaseUser"), "")
+        String dbPw   = nz(MainServlet.getEnvironment("DatabasePassword"), "")
+        return new Connection(Connection.ConnectionType.PostgreSQL, dbHost, dbPort, dbName, dbUser, dbPw)
+    }
+
+    /**
+     * Generate per-file LLM summaries for one project. Long-running (roughly a
+     * second per file), so it runs on a background thread behind the same
+     * per-project lock as indexing and is polled via status().
+     *
+     * Input:  { "project": "<name>", "regenerate": <bool, optional> }
+     */
+    void summarize(JSONObject injson, JSONObject outjson, Connection db, ProcessServlet servlet) {
+        String project = injson.getString("project", null)
+        if (project == null || !ProjectRegistry.isValidName(project) || ProjectRegistry.get(project) == null) {
+            outjson.put("started", false)
+            outjson.put("message", "Unknown or missing project: " + project)
+            return
+        }
+        boolean regenerate = injson.getBoolean("regenerate", Boolean.FALSE)
+        boolean symbols = injson.getBoolean("symbols", Boolean.FALSE)
+        if (!tryAcquireLock(db, project)) {
+            outjson.put("started", false)
+            outjson.put("message", "A sweep or summarize is already running for '${project}'")
+            return
+        }
+        logger.info("RAGAdmin.summarize[${project}] queued (regenerate=${regenerate})")
+        Thread t = new Thread({ ->
+            Connection bgDb = null
+            try {
+                String dbHost = nz(MainServlet.getEnvironment("DatabaseHost"), "localhost")
+                int    dbPort = Integer.parseInt(nz(MainServlet.getEnvironment("DatabasePort"), "5432"))
+                String dbName = (String) MainServlet.getEnvironment("DatabaseName")
+                String dbUser = nz(MainServlet.getEnvironment("DatabaseUser"), "")
+                String dbPw   = nz(MainServlet.getEnvironment("DatabasePassword"), "")
+                bgDb = new Connection(Connection.ConnectionType.PostgreSQL, dbHost, dbPort, dbName, dbUser, dbPw)
+                JSONObject params = new JSONObject()
+                params.put("project", project)
+                params.put("regenerate", regenerate)
+                params.put("symbols", symbols)
+                JSONObject stats = (JSONObject) GroovyService.run(
+                        "scripts", "RAGSummarizer", "runJson", null, bgDb, params)
+                bgDb.commit()
+                logger.info("RAGAdmin.summarize[${project}] finished: " + stats.toString())
+            } catch (Throwable e) {
+                logger.error("RAGAdmin.summarize[${project}] failed", e)
+                try { bgDb?.rollback() } catch (Exception ignored) {}
+            } finally {
+                try { releaseLock(bgDb, project) } catch (Exception ignored) {}
+                try { bgDb?.close() } catch (Exception ignored) {}
+            }
+        } as Runnable, "RAGSummarize-" + project)
+        t.setDaemon(true)
+        t.start()
+        outjson.put("started", true)
+        outjson.put("project", project)
+        outjson.put("message", "Summarization started; poll services/RAGAdmin.status")
+    }
+
+    /**
      * Reconcile DB state with rag-projects.json:
      *   • drop schemas for projects no longer in the file (CASCADE)
      *   • create schemas + tables for new projects

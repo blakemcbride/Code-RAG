@@ -91,6 +91,9 @@ public class Tasks {
     /** Argument captured by {@code scan <project|all>} on the command line. */
     static String scanTarget = null;
 
+    /** Set by {@code scan ... --full} — TRUNCATE and rebuild rather than sweep incrementally. */
+    static boolean scanFull = false;
+
     /**
      * Positional args captured after a known multi-arg command name
      * (everything that follows the command on the CLI). Tasks like
@@ -101,7 +104,8 @@ public class Tasks {
     /** Commands whose trailing CLI positionals are slurped into {@link #commandArgs}. */
     private static final java.util.Set<String> COMMANDS_WITH_ARGS =
             new java.util.HashSet<>(java.util.Arrays.asList(
-                    "scan", "new-project", "remove-project", "add-root", "remove-root"));
+                    "scan", "new-project", "remove-project", "add-root", "remove-root", "eval",
+                    "history", "summarize", "defs", "deps", "usage"));
 
     /** Set by {@code -y} / {@code --yes} — suppress the confirmation prompt before destructive reconcile actions. */
     static boolean assumeYes = false;
@@ -237,7 +241,8 @@ public class Tasks {
         println("start                                     build and run backend in the background");
         println("stop                                      stop the background backend");
         println("status                                    report whether the system is running and its config");
-        println("scan <project|all>                        reconcile rag-projects.json then rescan");
+        println("scan <project|all> [--full]               reconcile rag-projects.json then rescan");
+        println("                                          --full TRUNCATEs and rebuilds from scratch");
         println("new-project <name> [--project-dir <dir>] <root> [<root>...]");
         println("                                          add a project + bootstrap + register MCP entries");
         println("                                          --project-dir <dir> drops .mcp.json + a CLAUDE.md");
@@ -247,6 +252,15 @@ public class Tasks {
         println("remove-project <name>                     drop a project + deregister MCP entries");
         println("add-root <name> <root> [<root>...]        add roots to an existing project");
         println("remove-root <name> <root> [<root>...]     remove roots from an existing project");
+        println("history <project|all>                     index git/svn commit history (search_history)");
+        println("defs <project|all>                        extract ctags symbol definitions (find_symbol)");
+        println("deps <project|all>                        backfill the import graph (find_dependents)");
+        println("usage <project|all>                       is the tool actually being called? (from rag_query_log)");
+        println("summarize <project|all> [--regenerate]    generate per-file LLM summaries (slow, GPU-bound)");
+        println("summarize <project|all> --symbols       per-symbol summaries for large files (slower)");
+        println("eval <project> [--baseline]               score retrieval against eval/<project>-queries.jsonl");
+        println("                                          --baseline records the run as the comparison point;");
+        println("                                          otherwise the run is diffed against eval/baseline.json");
     }
 
     /**
@@ -559,6 +573,81 @@ public class Tasks {
             String projectDir = p.has("project_dir") ? p.getString("project_dir", null) : null;
             registerMcpEntries(name, roots, projectDir);
         }
+        reassertAllProjectsEntry(hasClaude, hasCodex);
+        writeRoutingRules();
+    }
+
+    /**
+     * Drop a routing rule into every indexed root so Claude Code knows when to
+     * reach for this tool at all.
+     *
+     * Without it the whole system is invisible in practice: the agent sees
+     * search_code in its tool list, has no instruction about when it beats
+     * Grep, and Grep is the reflex. Every retrieval-quality number is
+     * conditional on the tool actually being called.
+     *
+     * Written to CLAUDE.local.md rather than CLAUDE.md deliberately:
+     *  - CLAUDE.md is often committed and shared; this is a fact about THIS
+     *    machine's local index, not about the repository.
+     *  - Some repositories (Kiss) explicitly forbid editing their CLAUDE.md.
+     *  - It keeps a tracked file from being modified in every indexed repo.
+     */
+    private static void writeRoutingRules() {
+        if (!"true".equalsIgnoreCase(readIniValue("RAGWriteRoutingRules", "true")))
+            return;
+        JSONObject cfg = loadProjectsJson();
+        if (cfg == null)
+            return;
+        JSONArray projects = cfg.getJSONArray("projects");
+        java.util.Set<String> done = new java.util.HashSet<>();
+        for (int i = 0; i < projects.length(); i++) {
+            JSONObject p = projects.getJSONObject(i);
+            JSONArray roots = p.has("roots") ? p.getJSONArray("roots") : new JSONArray();
+            for (int j = 0; j < roots.length(); j++) {
+                String root = roots.getString(j);
+                if (root == null || root.isEmpty() || !done.add(root))
+                    continue;
+                java.io.File dir = new java.io.File(root);
+                if (!dir.isDirectory())
+                    continue;
+                writeManagedBlock(new java.io.File(dir, "CLAUDE.local.md"));
+            }
+        }
+    }
+
+    /** MCP entry name for the cross-project endpoint. */
+    private static final String ALL_MCP_NAME = "code_rag_all";
+
+    /**
+     * Re-assert the cross-project ({@code /rag-mcp/_all}) registration.
+     *
+     * Registered at USER scope for Claude Code rather than per-root: a tool
+     * whose entire purpose is finding code in a repository you are NOT in is
+     * useless if it is only visible from inside those repositories.
+     *
+     * Re-asserting on every start matters because the entry embeds the shared
+     * secret. Rotate RAGMCPSharedSecret without this and both clients keep
+     * sending the old token, failing 401 with no obvious cause.
+     */
+    private static void reassertAllProjectsEntry(boolean hasClaude, boolean hasCodex) {
+        String url = MCP_BASE_URL + "/" + "_all";
+        String secret = readSharedSecret();
+        if (secret == null || secret.isEmpty())
+            return;
+        if (hasClaude) {
+            java.io.File cwd = new java.io.File(".");
+            // User scope is global, so the working directory is irrelevant —
+            // any directory will do for the CLI invocation.
+            runSilentInDir(cwd, "claude", "mcp", "remove", ALL_MCP_NAME, "-s", "user");
+            String[] captured = new String[1];
+            int code = runCapturedInDir(cwd, captured, "claude", "mcp", "add",
+                    "--transport", "http", "-s", "user", ALL_MCP_NAME, url,
+                    "--header", "X-RAG-Token: " + secret);
+            if (code != 0)
+                System.err.println("warning: could not register '" + ALL_MCP_NAME + "' with Claude Code.");
+        }
+        if (hasCodex)
+            registerCodexEntry(ALL_MCP_NAME, url, secret);
     }
 
     /**
@@ -640,8 +729,23 @@ public class Tasks {
      * timing.</p>
      */
     public static void scan() {
-        if (scanTarget == null || scanTarget.isEmpty()) {
-            System.err.println("Usage: ./bld scan <project|all>");
+        // Re-parse positionals here so flags can appear in any order and so
+        // "--full" is never mistaken for the project name.
+        boolean full = false;
+        String target = null;
+        for (String a : commandArgs) {
+            if ("--full".equals(a))
+                full = true;
+            else if (a.startsWith("-"))
+                System.err.println("unknown option: " + a);
+            else if (target == null)
+                target = a;
+        }
+        if (target != null)
+            scanTarget = target;
+        scanFull = full;
+        if (scanTarget == null || scanTarget.isEmpty() || scanTarget.startsWith("-")) {
+            System.err.println("Usage: ./bld scan <project|all> [--full]");
             return;
         }
         String httpP = extractFromFile("tomcat/conf/server.xml",
@@ -826,9 +930,10 @@ public class Tasks {
     /** Reindex one project synchronously, printing progress as files/chunks accumulate. */
     private static void scanOne(String baseUrl, String project) {
         println("");
-        println("Scanning " + project + "...");
+        println("Scanning " + project + (scanFull ? " (full rebuild)..." : "..."));
 
-        String reindexBody = "{\"_method\":\"reindex\",\"_class\":\"services/RAGAdmin\",\"project\":\"" + project + "\"}";
+        String reindexBody = "{\"_method\":\"reindex\",\"_class\":\"services/RAGAdmin\",\"project\":\"" + project + "\""
+                + (scanFull ? ",\"full\":true" : "") + "}";
         String resp = httpPostJson(baseUrl, reindexBody);
         if (resp.startsWith("error:")) {
             println("  " + resp);
@@ -912,6 +1017,535 @@ public class Tasks {
         } catch (java.io.IOException e) {
             return "error: " + e.getMessage();
         }
+    }
+
+    // ----- Retrieval eval ----------------------------------------------------
+    //
+    // ./bld eval <project> [--baseline] [--compare <file>] [--queries <file>]
+    //
+    // Drives services/RAGAdmin.eval, which runs the golden query set through
+    // the same RAGSearch code path the live MCP tool uses. Without --baseline,
+    // the run is automatically diffed against eval/baseline.json when present,
+    // because the delta is the only number that matters while tuning.
+
+    private static final String EVAL_DIR = "eval";
+
+    /**
+     * Run the retrieval-quality eval for one project and report the scores.
+     *
+     * <p>Query set defaults to {@code eval/<project>-queries.jsonl}. Results
+     * are always written to {@code eval/results-<timestamp>.json}; with
+     * {@code --baseline} they are additionally written to
+     * {@code eval/baseline.json}, which later runs diff against.</p>
+     */
+    public static void eval() {
+        String project = null;
+        String queriesPath = null;
+        String comparePath = null;
+        String granularity = "chunk";
+        boolean makeBaseline = false;
+        for (int i = 0; i < commandArgs.length; i++) {
+            String a = commandArgs[i];
+            if ("--baseline".equals(a)) {
+                makeBaseline = true;
+            } else if ("--compare".equals(a) && i + 1 < commandArgs.length) {
+                comparePath = commandArgs[++i];
+            } else if ("--queries".equals(a) && i + 1 < commandArgs.length) {
+                queriesPath = commandArgs[++i];
+            } else if ("--granularity".equals(a) && i + 1 < commandArgs.length) {
+                granularity = commandArgs[++i];
+            } else if (a.startsWith("-")) {
+                System.err.println("unknown option: " + a);
+                return;
+            } else if (project == null) {
+                project = a;
+            }
+        }
+        if (project == null || project.isEmpty()) {
+            System.err.println("Usage: ./bld eval <project> [--baseline] [--compare <file>] [--queries <file>]");
+            return;
+        }
+        if (queriesPath == null)
+            queriesPath = EVAL_DIR + "/" + project + "-queries.jsonl";
+        java.io.File qf = new java.io.File(queriesPath);
+        if (!qf.isFile()) {
+            System.err.println("Query set not found: " + qf.getPath());
+            System.err.println("Create it, or point at one with --queries <file>.");
+            return;
+        }
+
+        String httpP = extractFromFile("tomcat/conf/server.xml",
+                "<Connector port=\"(\\d+)\" protocol=\"HTTP/1\\.1\"", httpPort);
+        if (!portListening("127.0.0.1", parseIntOr(httpP, 0))) {
+            System.err.println("Server is not running on port " + httpP + ". Start it with './bld start' first.");
+            return;
+        }
+
+        JSONObject req = new JSONObject();
+        req.put("_class", "services/RAGAdmin");
+        req.put("_method", "eval");
+        req.put("project", project);
+        req.put("queryFile", qf.getAbsolutePath());
+        req.put("granularity", granularity);
+
+        println("");
+        println("Running eval: " + project + "  (" + qf.getPath() + ")");
+        long t0 = System.currentTimeMillis();
+        // Generous timeout: the first query pays Ollama's model load.
+        String resp = httpPostJson("http://127.0.0.1:" + httpP + "/rest", req.toString(), 600_000);
+        if (resp.startsWith("error:")) {
+            System.err.println(resp);
+            return;
+        }
+        JSONObject res;
+        try {
+            res = new JSONObject(resp);
+        } catch (JSONException e) {
+            System.err.println("Unparseable response: " + (resp.length() > 300 ? resp.substring(0, 300) + "…" : resp));
+            return;
+        }
+        if (res.has("error")) {
+            System.err.println("eval failed: " + res.getString("error"));
+            return;
+        }
+        // Kiss reports transport/auth failures via _Success/_ErrorMessage rather
+        // than the service's own "error" key. Without this the report below
+        // silently prints an all-zero table.
+        if (!res.getBoolean("_Success", Boolean.TRUE)) {
+            System.err.println("eval failed: " + res.getString("_ErrorMessage", "(no message)"));
+            if (res.getInt("_ErrorCode", 0) == 2)
+                System.err.println("  services/RAGAdmin.eval must be allowlisted in KissInit.groovy "
+                        + "via MainServlet.allowWithoutAuthentication.");
+            return;
+        }
+        println("  completed in " + ((System.currentTimeMillis() - t0) / 1000L) + "s");
+
+        printEvalReport(res);
+
+        // Persist. Timestamp is filesystem-safe and sorts chronologically.
+        String stamp = new java.text.SimpleDateFormat("yyyyMMdd-HHmmss").format(new java.util.Date());
+        new java.io.File(EVAL_DIR).mkdirs();
+        String resultsPath = EVAL_DIR + "/results-" + stamp + ".json";
+        if (!writeTextFile(resultsPath, res.toString(2)))
+            return;
+        println("");
+        println("  wrote " + resultsPath);
+        if (makeBaseline) {
+            if (writeTextFile(EVAL_DIR + "/baseline.json", res.toString(2)))
+                println("  wrote " + EVAL_DIR + "/baseline.json  (future runs diff against this)");
+        }
+
+        // Diff against an explicit --compare target, else the baseline.
+        String against = comparePath != null ? comparePath : (EVAL_DIR + "/baseline.json");
+        if (!makeBaseline && new java.io.File(against).isFile()) {
+            try {
+                JSONObject base = new JSONObject(readTextFile(against));
+                printEvalDiff(base, res, against);
+            } catch (Exception e) {
+                System.err.println("  could not diff against " + against + ": " + e.getMessage());
+            }
+        }
+        println("");
+    }
+
+    /**
+     * Index VCS commit history (git and Subversion) for one project or all.
+     * Incremental after the first run.
+     */
+    public static void history() {
+        java.util.List<String> targets = resolveProjectTargets("history");
+        if (targets == null)
+            return;
+        String baseUrl = liveRestUrl();
+        if (baseUrl == null)
+            return;
+        for (String p : targets) {
+            JSONObject req = new JSONObject();
+            req.put("_class", "services/RAGAdmin");
+            req.put("_method", "history");
+            req.put("project", p);
+            println("");
+            println("Indexing history for " + p + "...");
+            String resp = httpPostJson(baseUrl, req.toString(), 60_000);
+            JSONObject r = parseOrNull(resp);
+            if (r == null || !r.getBoolean("started", Boolean.FALSE)) {
+                System.err.println("  " + (r == null ? resp : r.getString("message", resp)));
+                continue;
+            }
+            pollUntilIdle(baseUrl, p);
+        }
+        println("");
+    }
+
+    /**
+     * Report real usage: is anything actually calling the tool?
+     *
+     * Retrieval metrics say the tool can find things; this says whether Claude
+     * Code is asking it to. If searches stay at zero, ranking work is not
+     * reaching the agent and the routing rules are the thing to fix.
+     */
+    public static void usage() {
+        java.util.List<String> targets = resolveProjectTargets("usage");
+        if (targets == null)
+            return;
+        String baseUrl = liveRestUrl();
+        if (baseUrl == null)
+            return;
+        for (String p : targets) {
+            JSONObject req = new JSONObject();
+            req.put("_class", "services/RAGAdmin");
+            req.put("_method", "usage");
+            req.put("project", p);
+            JSONObject r = parseOrNull(httpPostJson(baseUrl, req.toString(), 120_000));
+            if (r == null || r.has("error")) {
+                System.err.println(p + ": " + (r == null ? "(no response)" : r.getString("error")));
+                continue;
+            }
+            long searches = r.getLong("searches", 0L);
+            long fetches = r.getLong("fetches", 0L);
+            println("");
+            println("  " + p);
+            println("    searches: " + searches + "   follow-up fetches: " + fetches
+                    + "   zero-result: " + r.getLong("zeroResultSearches", 0L)
+                    + "   avg " + r.getLong("avgLatencyMs", 0L) + "ms");
+            if (searches == 0) {
+                println("    NOT BEING USED. Retrieval quality is irrelevant until something calls it —");
+                println("    check the routing block in <root>/CLAUDE.local.md and the MCP registration.");
+                continue;
+            }
+            println(String.format("    follow-up rate: %.0f%% (how often a result was actually opened)",
+                    100.0 * fetches / searches));
+            JSONArray daily = r.getJSONArray("daily");
+            if (daily != null && daily.length() > 0) {
+                println("    recent days:");
+                for (int i = 0; i < Math.min(7, daily.length()); i++) {
+                    JSONObject d = daily.getJSONObject(i);
+                    println(String.format("      %s  %4d searches  %4d fetches",
+                            d.getString("date", "?"), d.getLong("searches", 0L), d.getLong("fetches", 0L)));
+                }
+            }
+            JSONArray top = r.getJSONArray("topQueries");
+            if (top != null && top.length() > 0) {
+                println("    most frequent queries:");
+                for (int i = 0; i < Math.min(5, top.length()); i++) {
+                    JSONObject q = top.getJSONObject(i);
+                    String qq = q.getString("query", "");
+                    println(String.format("      %2dx  %s", q.getLong("count", 0L),
+                            qq.length() > 62 ? qq.substring(0, 62) + "…" : qq));
+                }
+            }
+        }
+        println("");
+    }
+
+    /** Backfill the import graph for files indexed before it existed. */
+    public static void deps() {
+        java.util.List<String> targets = resolveProjectTargets("deps");
+        if (targets == null)
+            return;
+        String baseUrl = liveRestUrl();
+        if (baseUrl == null)
+            return;
+        for (String p : targets) {
+            JSONObject req = new JSONObject();
+            req.put("_class", "services/RAGAdmin");
+            req.put("_method", "deps");
+            req.put("project", p);
+            println("Building import graph for " + p + "...");
+            JSONObject r = parseOrNull(httpPostJson(baseUrl, req.toString(), 900_000));
+            if (r == null || r.has("error")) {
+                System.err.println("  failed: " + (r == null ? "(no response)" : r.getString("error")));
+                continue;
+            }
+            println("  " + r.getLong("edges", 0L) + " import edges from "
+                    + r.getInt("filesScanned", 0) + " files in " + r.getLong("elapsedSec", 0L) + "s");
+        }
+        println("");
+    }
+
+    /** Extract symbol definitions with ctags into rag_def (the code-graph index). */
+    public static void defs() {
+        java.util.List<String> targets = resolveProjectTargets("defs");
+        if (targets == null)
+            return;
+        String baseUrl = liveRestUrl();
+        if (baseUrl == null)
+            return;
+        for (String p : targets) {
+            JSONObject req = new JSONObject();
+            req.put("_class", "services/RAGAdmin");
+            req.put("_method", "defs");
+            req.put("project", p);
+            println("Extracting definitions for " + p + "...");
+            JSONObject r = parseOrNull(httpPostJson(baseUrl, req.toString(), 900_000));
+            if (r == null || r.has("error")) {
+                System.err.println("  failed: " + (r == null ? "(no response)" : r.getString("error")));
+                continue;
+            }
+            println("  " + r.getInt("definitions", 0) + " definitions across "
+                    + r.getInt("roots", 0) + " root(s) in " + r.getLong("elapsedSec", 0L) + "s");
+            String detail = r.getString("detail", "");
+            if (!detail.isEmpty())
+                println("  " + detail);
+        }
+        println("");
+    }
+
+    /**
+     * Generate per-file LLM summaries. Long-running (roughly a second per
+     * file) and GPU-bound; polls until each project finishes.
+     */
+    public static void summarize() {
+        java.util.List<String> targets = resolveProjectTargets("summarize");
+        if (targets == null)
+            return;
+        String baseUrl = liveRestUrl();
+        if (baseUrl == null)
+            return;
+        boolean regenerate = false;
+        boolean symbols = false;
+        for (String a : commandArgs) {
+            if ("--regenerate".equals(a))
+                regenerate = true;
+            else if ("--symbols".equals(a))
+                symbols = true;
+        }
+
+        for (String p : targets) {
+            JSONObject req = new JSONObject();
+            req.put("_class", "services/RAGAdmin");
+            req.put("_method", "summarize");
+            req.put("project", p);
+            req.put("regenerate", regenerate);
+            req.put("symbols", symbols);
+            println("");
+            println("Summarizing " + p + (symbols ? " (per-symbol, large files only)..."
+                                                  : regenerate ? " (regenerate all)..." : "..."));
+            String resp = httpPostJson(baseUrl, req.toString(), 60_000);
+            JSONObject r = parseOrNull(resp);
+            if (r == null || !r.getBoolean("started", Boolean.FALSE)) {
+                System.err.println("  " + (r == null ? resp : r.getString("message", resp)));
+                continue;
+            }
+            pollUntilIdle(baseUrl, p);
+        }
+        println("");
+    }
+
+    /**
+     * Poll status until the project's background job finishes, printing any
+     * progress it reports. Shared by history and summarize — both run behind
+     * the same per-project lock, so "indexing" going false means done.
+     */
+    private static void pollUntilIdle(String baseUrl, String project) {
+        JSONObject sreq = new JSONObject();
+        sreq.put("_class", "services/RAGAdmin");
+        sreq.put("_method", "status");
+        sreq.put("project", project);
+        long start = System.currentTimeMillis();
+        while (true) {
+            try { Thread.sleep(5000); } catch (InterruptedException e) { Thread.currentThread().interrupt(); return; }
+            String resp = httpPostJson(baseUrl, sreq.toString(), 60_000);
+            JSONObject r = parseOrNull(resp);
+            if (r == null) {
+                System.err.println("  status poll failed: " + resp);
+                return;
+            }
+            long elapsed = (System.currentTimeMillis() - start) / 1000L;
+            JSONObject meta = r.has("meta") ? r.getJSONObject("meta") : null;
+            String prog = meta == null ? null : meta.getString("summarize_progress", null);
+            if (prog != null) {
+                JSONObject p = parseOrNull(prog);
+                if (p != null)
+                    println(String.format("  [%-8s]  %d/%d files  (eta %s)",
+                            humanDuration(elapsed), p.getInt("done", 0), p.getInt("total", 0),
+                            humanDuration(p.getInt("etaSec", 0))));
+            }
+            if (!r.getBoolean("indexing", Boolean.FALSE)) {
+                println(String.format("  [%-8s]  DONE", humanDuration(elapsed)));
+                return;
+            }
+        }
+    }
+
+    /** Shared "<project|all>" positional resolution for history/summarize. */
+    private static java.util.List<String> resolveProjectTargets(String cmd) {
+        String target = null;
+        for (String a : commandArgs)
+            if (!a.startsWith("-") && target == null)
+                target = a;
+        if (target == null || target.isEmpty()) {
+            System.err.println("Usage: ./bld " + cmd + " <project|all>");
+            return null;
+        }
+        java.util.List<String> known = readProjectNames(PROJECTS_JSON_PATH);
+        if ("all".equalsIgnoreCase(target)) {
+            if (known.isEmpty()) {
+                System.err.println("No projects found in " + PROJECTS_JSON_PATH);
+                return null;
+            }
+            return known;
+        }
+        if (!known.isEmpty() && !known.contains(target))
+            System.err.println("warning: '" + target + "' is not in rag-projects.json (known: " + known + ")");
+        return java.util.Collections.singletonList(target);
+    }
+
+    /** Base /rest URL of the running server, or null (with a message) if it is down. */
+    private static String liveRestUrl() {
+        String httpP = extractFromFile("tomcat/conf/server.xml",
+                "<Connector port=\"(\\d+)\" protocol=\"HTTP/1\\.1\"", httpPort);
+        if (!portListening("127.0.0.1", parseIntOr(httpP, 0))) {
+            System.err.println("Server is not running on port " + httpP + ". Start it with './bld start' first.");
+            return null;
+        }
+        return "http://127.0.0.1:" + httpP + "/rest";
+    }
+
+    /**
+     * Parse a JSON-RPC reply, returning null on transport failure OR on a Kiss
+     * framework-level failure. Without the {@code _Success} check a rejected
+     * call parses cleanly, yields no fields, and the caller cheerfully reports
+     * zeros — which is exactly how an auth failure once looked like "0 commits
+     * across 0 roots".
+     */
+    private static JSONObject parseOrNull(String s) {
+        if (s == null || s.startsWith("error:"))
+            return null;
+        JSONObject o;
+        try {
+            o = new JSONObject(s);
+        } catch (JSONException e) {
+            return null;
+        }
+        if (!o.getBoolean("_Success", Boolean.TRUE)) {
+            System.err.println("  request rejected: " + o.getString("_ErrorMessage", "(no message)"));
+            if (o.getInt("_ErrorCode", 0) == 2)
+                System.err.println("  (the service must be allowlisted in KissInit.groovy via "
+                        + "MainServlet.allowWithoutAuthentication)");
+            return null;
+        }
+        return o;
+    }
+
+    /** Print the overall / per-split / per-tag score table. */
+    private static void printEvalReport(JSONObject res) {
+        JSONObject cfg = res.has("config") ? res.getJSONObject("config") : new JSONObject();
+        println("");
+        println("  " + res.getInt("queryCount", 0) + " queries, chunkK=" + res.getInt("chunkK", 0)
+                + ", model=" + cfg.getString("embeddingModel", "?")
+                + ", ef_search=" + cfg.getString("hnswEfSearch", "?"));
+        println("  index: " + cfg.getLong("fileCount", 0L) + " files, "
+                + cfg.getLong("chunkCount", 0L) + " chunks");
+        println("");
+        println(String.format("  %-16s %4s  %6s %6s %6s  %9s %7s %8s %5s  %6s %6s",
+                "scope", "n", "hit@1", "hit@5", "hit@10", "recall@10", "mrr@10", "ndcg@10", "miss", "p50ms", "p95ms"));
+        printEvalRow("overall", res.getJSONObject("overall"));
+        if (res.has("bySplit")) {
+            JSONObject bs = res.getJSONObject("bySplit");
+            for (String k : new java.util.TreeSet<>(bs.keySet()))
+                printEvalRow("split:" + k, bs.getJSONObject(k));
+        }
+        if (res.has("byTag")) {
+            JSONObject bt = res.getJSONObject("byTag");
+            for (String k : new java.util.TreeSet<>(bt.keySet()))
+                printEvalRow("tag:" + k, bt.getJSONObject(k));
+        }
+    }
+
+    private static void printEvalRow(String label, JSONObject m) {
+        println(String.format("  %-16s %4d  %6.3f %6.3f %6.3f  %9.3f %7.3f %8.3f %5d  %6d %6d",
+                label,
+                m.getInt("n", 0),
+                m.getDouble("hit@1", 0.0),
+                m.getDouble("hit@5", 0.0),
+                m.getDouble("hit@10", 0.0),
+                m.getDouble("recall@10", 0.0),
+                m.getDouble("mrr@10", 0.0),
+                m.getDouble("ndcg@10", 0.0),
+                m.getInt("totalMisses", 0),
+                m.getLong("p50TotalMs", 0L),
+                m.getLong("p95TotalMs", 0L)));
+    }
+
+    /**
+     * Print metric deltas plus the per-query rank movements. The per-query
+     * list is what you actually use while tuning — an aggregate that improves
+     * while five specific queries regress is worth knowing about.
+     */
+    private static void printEvalDiff(JSONObject base, JSONObject now, String againstPath) {
+        println("");
+        println("  vs " + againstPath + ":");
+        JSONObject bo = base.getJSONObject("overall");
+        JSONObject no = now.getJSONObject("overall");
+        String[] metrics = {"hit@1", "hit@5", "hit@10", "recall@10", "mrr@10", "ndcg@10"};
+        println(String.format("    %-12s %9s %9s %9s", "metric", "baseline", "now", "delta"));
+        for (String k : metrics) {
+            double b = bo.getDouble(k, 0.0);
+            double n = no.getDouble(k, 0.0);
+            println(String.format("    %-12s %9.3f %9.3f %+9.3f", k, b, n, n - b));
+        }
+        long bp = bo.getLong("p50TotalMs", 0L), np = no.getLong("p50TotalMs", 0L);
+        println(String.format("    %-12s %9d %9d %+9d", "p50ms", bp, np, np - bp));
+
+        // Per-query rank movement, keyed by query text.
+        java.util.Map<String, Integer> baseRank = new java.util.HashMap<>();
+        JSONArray bq = base.getJSONArray("perQuery");
+        for (int i = 0; i < bq.length(); i++) {
+            JSONObject r = bq.getJSONObject(i);
+            baseRank.put(r.getString("q"), r.getInt("firstRelevantRank", 0));
+        }
+        java.util.List<String> better = new java.util.ArrayList<>();
+        java.util.List<String> worse = new java.util.ArrayList<>();
+        int same = 0;
+        JSONArray nq = now.getJSONArray("perQuery");
+        for (int i = 0; i < nq.length(); i++) {
+            JSONObject r = nq.getJSONObject(i);
+            String q = r.getString("q");
+            if (!baseRank.containsKey(q))
+                continue;
+            int b = baseRank.get(q);
+            int n = r.getInt("firstRelevantRank", 0);
+            if (b == n) {
+                same++;
+                continue;
+            }
+            // Rank 0 means "never found"; treat it as worse than any real rank.
+            int bEff = (b == 0) ? Integer.MAX_VALUE : b;
+            int nEff = (n == 0) ? Integer.MAX_VALUE : n;
+            String line = String.format("      %-6s %s -> %s   \"%s\"",
+                    nEff < bEff ? "better" : "worse",
+                    b == 0 ? "miss" : Integer.toString(b),
+                    n == 0 ? "miss" : Integer.toString(n),
+                    q.length() > 64 ? q.substring(0, 64) + "…" : q);
+            if (nEff < bEff)
+                better.add(line);
+            else
+                worse.add(line);
+        }
+        println("");
+        println("    rank of first expected file:  better=" + better.size()
+                + "  worse=" + worse.size() + "  unchanged=" + same);
+        for (String s : worse)
+            println(s);
+        for (String s : better)
+            println(s);
+    }
+
+    private static boolean writeTextFile(String path, String content) {
+        try {
+            java.nio.file.Files.write(java.nio.file.Paths.get(path),
+                    content.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            return true;
+        } catch (java.io.IOException e) {
+            System.err.println("cannot write " + path + ": " + e.getMessage());
+            return false;
+        }
+    }
+
+    private static String readTextFile(String path) throws java.io.IOException {
+        return new String(java.nio.file.Files.readAllBytes(java.nio.file.Paths.get(path)),
+                java.nio.charset.StandardCharsets.UTF_8);
     }
 
     /**
@@ -1186,6 +1820,14 @@ public class Tasks {
      * suggestion when one can be safely derived.
      */
     private static boolean requireValidProjectName(String name) {
+        // "all" is already the wildcard for `bld scan all`, and it reads as the
+        // cross-project endpoint (/rag-mcp/_all). A project literally named
+        // "all" would make both ambiguous.
+        if ("all".equals(name)) {
+            System.err.println("Project name 'all' is reserved: 'bld scan all' means every project, "
+                    + "and cross-project search lives at /rag-mcp/_all.");
+            return false;
+        }
         if (PROJECT_NAME_RE.matcher(name).matches())
             return true;
         String suggested = name.toLowerCase()
@@ -1400,21 +2042,32 @@ public class Tasks {
     private static final String CLAUDE_MD_BLOCK_END =
             "<!-- END code-rag managed block -->";
     private static final String CLAUDE_MD_BLOCK_BODY =
-            "This repository is indexed by Code-RAG (a local MCP server exposing\n" +
-            "`search_code`, `get_chunk`, `list_repos`, `index_status`). Choose tool\n" +
-            "by what you are looking for:\n" +
+            "This repository is indexed by Code-RAG, a local MCP server. Choose your\n" +
+            "search tool by WHAT YOU KNOW, not by habit:\n" +
             "\n" +
-            "- Exact known string, symbol, file name, or import → use Grep / Glob.\n" +
-            "- Conceptual lookup (\"where do we handle retries\", \"what code does X\",\n" +
-            "  \"find anything related to permission checks\") → use `search_code`.\n" +
-            "  It does similarity search over the whole tree and finds related code\n" +
-            "  grep cannot, without having to guess keywords.\n" +
-            "- Confirm or expand a `search_code` hit → `get_chunk` for just that\n" +
-            "  chunk, or Read on the returned path + line range for surrounding code.\n" +
+            "- You know the exact token (symbol, string, file name, import) →\n" +
+            "  **Grep / Glob**. Nothing beats it when you can name the thing.\n" +
+            "- You know the CONCEPT but not the token (\"where do we enforce the\n" +
+            "  session timeout\", \"what calculates benefit cost\", \"how is X wired\n" +
+            "  up\") → **`search_code`**. Guessing keywords for Grep is the failure\n" +
+            "  mode it exists to remove.\n" +
+            "- You want to know WHY something is the way it is, when it changed, or\n" +
+            "  what moved with it → **`search_history`** (indexed git and Subversion\n" +
+            "  commit messages). No amount of reading the tree answers this.\n" +
             "\n" +
-            "Default to `search_code` for any \"find code that does X\" question when X\n" +
-            "is a concept rather than a literal token. Default to Grep when X is a\n" +
-            "token you already know appears verbatim.\n";
+            "`search_code` returns ranked FILES by default, each with the symbols that\n" +
+            "matched and an excerpt already widened to the whole enclosing function, so\n" +
+            "one call is usually enough — Read the returned path and line range only\n" +
+            "when you need more context around it. It covers every repository in this\n" +
+            "project at once, which a directory-scoped Grep cannot.\n" +
+            "\n" +
+            "If the answer might live in a DIFFERENT repository, use the `code_rag_all`\n" +
+            "server, which searches every indexed project and tags each hit with the\n" +
+            "project it came from.\n" +
+            "\n" +
+            "After you create or edit files, call `reindex_path` on them if you intend\n" +
+            "to search for them in this session — the background sweep runs only every\n" +
+            "few minutes, so your own new code is otherwise invisible to `search_code`.\n";
 
     /**
      * Create or update {@code <projectDir>/CLAUDE.md} so it contains the
@@ -1424,7 +2077,14 @@ public class Tasks {
      * Otherwise the block is appended.
      */
     private static void writeClaudeMdBlock(java.io.File projectDir) {
-        java.io.File md = new java.io.File(projectDir, "CLAUDE.md");
+        writeManagedBlock(new java.io.File(projectDir, "CLAUDE.md"));
+    }
+
+    /**
+     * Write the routing block into an explicit markdown file, replacing any
+     * previous managed block and preserving everything outside the markers.
+     */
+    private static void writeManagedBlock(java.io.File md) {
         String existing;
         boolean preexisting = md.exists();
         if (preexisting) {
@@ -1552,6 +2212,13 @@ public class Tasks {
     }
 
     /** Read RAGMCPSharedSecret from application.ini, "" on missing/empty (auth is off). */
+    /** One value from application.ini, or a default when absent/empty. */
+    private static String readIniValue(String key, String dflt) {
+        java.util.Map<String, String> cfg = readIni(APP_INI_PATH);
+        String v = cfg.get(key);
+        return (v == null || v.isEmpty()) ? dflt : v;
+    }
+
     private static String readSharedSecret() {
         java.util.Map<String, String> cfg = readIni(APP_INI_PATH);
         String secret = cfg.get("RAGMCPSharedSecret");

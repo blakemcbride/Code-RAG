@@ -36,8 +36,20 @@ are authoritative — update them rather than reinventing.
 
 | Path | Role |
 |---|---|
-| `src/main/precompiled/org/kissweb/rag/RAGMCPServer.java` | The MCP server. URL `/rag-mcp/<project>` |
+| `src/main/precompiled/org/kissweb/rag/RAGMCPServer.java` | The MCP server. URL `/rag-mcp/<project>`, plus the reserved `/rag-mcp/_all` cross-project endpoint. Thin: arg parsing, MCP envelope, path translation |
+| `src/main/precompiled/org/kissweb/rag/RAGSearch.java` | **The whole read path** — query embedding, hybrid retrieval, RRF fusion, rerank, path resolution. Shared by the MCP server and the eval harness so the two cannot drift |
+| `src/main/precompiled/org/kissweb/rag/RAGTokenizer.java` | Identifier-aware tokenizer (camelCase/snake_case splitting) + query stoplist. Shared by indexer and search — a divergence here silently disables lexical matching |
 | `src/main/precompiled/org/kissweb/rag/ProjectRegistry.java` | Loads `rag-projects.json`, validates names against `[a-z][a-z0-9_]*` |
+| `src/main/backend/scripts/RAGEval.groovy` | Retrieval-quality eval. Scores a golden query set through `RAGSearch` |
+| `src/main/backend/scripts/RAGHistory.groovy` | Indexes commit history into `rag_commit`. Handles **git and Subversion** — the roots are not all git |
+| `src/main/backend/scripts/RAGSummarizer.groovy` | Generates + embeds one-paragraph LLM summaries per file (`./bld summarize`) |
+| `src/main/backend/scripts/RAGSummarizer.groovy` (`--symbols`) | Also generates per-symbol summaries for large files into `rag_symbol` |
+| `eval/<project>-queries.jsonl` | Golden query sets (committed) |
+| `src/main/backend/scripts/RAGDefs.groovy` | ctags symbol definitions into `rag_def` — the structural half of the index (`find_symbol`) |
+| `rag_def` / `rag_dep` (per project) | The structural index: ctags definitions, and the import graph. Neither needs an LLM or a rebuild |
+| `eval/turns.py` | Turns-to-answer harness: search_code vs grep, tool calls to answer |
+| `eval/mine.py` | Builds candidate query-set entries from `rag_query_log` (real usage) |
+| `eval/baseline.json`, `eval/results-*.json` | Eval output; `./bld eval` diffs against the baseline |
 | `src/main/precompiled/Tasks.java` | The `bld` build script. Contains `start`, `stop`, `status`, `scan`, port options, server.xml rewriter |
 | `src/main/backend/scripts/RAGIndexer.groovy` | Walker, chunker (50+ languages), embedder, change detection |
 | `src/main/backend/scripts/ProjectBootstrap.groovy` | `CREATE SCHEMA` + tables per project; returns empty-rag_file list for auto-scan |
@@ -75,7 +87,19 @@ the user can port it upstream rather than carrying a local fork.
 ./bld stop                                        # graceful shutdown
 ./bld status                                      # is it running? which ports? config? projects? MCP entries?
 ./bld scan <project|all>                          # reconcile rag-projects.json with DB, then incremental sweep
+./bld scan <project|all> --full                   # TRUNCATE + rebuild from scratch (required after a schema migration)
 ./bld -y scan <project|all>                       # same, but skip the destructive-action confirmation prompt
+./bld eval <project> [--baseline] [--granularity file|chunk]
+                                                  # score retrieval; --baseline records the comparison point
+./bld history <project|all>                        # index git + svn commit history (search_history)
+./bld summarize <project|all> [--symbols]          # per-file (or per-symbol) LLM summaries; GPU-bound
+python3 eval/turns.py <queries> <root> <url> <tok> # tool calls to answer: search_code vs grep
+./bld defs <project|all>                          # extract ctags symbol definitions (find_symbol)
+./bld deps <project|all>                          # backfill the import graph (find_dependents)
+./bld usage <project|all>                         # is anything actually calling the tool?
+python3 eval/mine.py <project>                    # candidate query-set entries from real usage
+                                                  #   eval diffs against eval/baseline.json when present and
+                                                  #   reports per-query rank movements. Server must be running.
 ./bld new-project <name> [--project-dir <dir>] <root> [<root>...]
                                                   # add a project, scan it, auto-register MCP entries with Claude Code / Codex
                                                   # --project-dir <dir>: umbrella directory above the roots (NOT indexed);
@@ -151,6 +175,31 @@ every `./bld start` so per-invocation overrides "stick" for that run.
   absolute. Absolute paths are recomputed at query time from
   `rag-projects.json`'s `roots[]`.
 
+### Schema migrations
+
+`ProjectBootstrap.ensureSchema` only does `CREATE TABLE IF NOT EXISTS`,
+so it cannot evolve an existing table. **Any change to the per-project
+tables must go through the migration ladder**, not by editing the CREATE
+statements alone:
+
+1. Bump `ProjectBootstrap.CURRENT_SCHEMA_VERSION`.
+2. Add a case to `applyMigration()` using `ADD COLUMN IF NOT EXISTS` /
+   `CREATE INDEX IF NOT EXISTS` (every step must be idempotent — a
+   server killed mid-migration re-runs it).
+3. Also update the `CREATE TABLE` in `ensureSchema` so fresh schemas are
+   born at the current shape.
+4. If the change adds a column the indexer must populate, call
+   `markRebuildRequired()`. `RAGIndexer.doSweep` then refuses an
+   incremental sweep — which would only revisit files whose sha256
+   changed and silently leave most rows unfilled — until
+   `./bld scan <project> --full` clears it.
+
+Current version: **2** (v2 added `rag_chunk.lexemes`, the generated
+`lexemes_tsv`, and its GIN index for hybrid search).
+
+`EmbeddingDim` comes from `application.ini` in both `ProjectBootstrap`
+and `RAGIndexer` — do not reintroduce a hardcoded dimension.
+
 ## Sweep / scan triggers (which thing causes an index update)
 
 1. **Startup auto-scan** — `KissInit.init2` runs an incremental sweep
@@ -174,6 +223,28 @@ same project cannot overlap; different projects can sweep in parallel.
 Reconcile also takes the lock for drops and root-deletes (skipping any
 project currently being indexed).
 
+## Cross-project search (`/rag-mcp/_all`)
+
+`_all` is a reserved URL segment, checked in `authenticate()` *before* the
+registry lookup. It begins with an underscore, which the
+`[a-z][a-z0-9_]*` project-name rule forbids, so it can never be shadowed
+by a real project. `bld` additionally refuses to create a project named
+`all`, since `bld scan all` already means "every project".
+
+On that endpoint `search_code` fans out across every configured project,
+embedding the query **once** and reusing the vector for each schema —
+embedding dominates cost, so N projects is far cheaper than N searches.
+Results come back as chunks, each tagged with its owning `project`;
+`get_chunk` on `_all` therefore requires a `project` argument, because
+chunk ids are only unique within a schema. `list_repos` and
+`index_status` aggregate across projects.
+
+Ordering caveat: per-project scores are RRF ranks, so each project's top
+hit scores about the same regardless of corpus size. Merging by score
+interleaves projects rather than strictly ordering by relevance — which
+suits "which repo has this?" but is not the ranking a single-project
+search would give.
+
 ## Authentication / security
 
 - Tomcat binds to `127.0.0.1` only (loopback). No LAN exposure.
@@ -184,6 +255,104 @@ project currently being indexed).
 
 ## Common pitfalls (worth knowing before editing)
 
+- **`excludeGlobs` ADDS to the base excludes; it does not replace them.**
+  `ProjectRegistry.BASE_EXCLUDES` (build output, VCS/IDE state, minified
+  assets, source maps, generated jsdoc, lockfiles) is applied to every
+  project unconditionally. The old behavior was "replace", so declaring
+  one extra exclusion silently lost `node_modules`/`.git`/etc. and every
+  project had to re-list the whole set defensively.
+- **Never put a common domain word in a directory glob.** `**/vendor/**`
+  looks obviously safe and is not: in a business application "vendor"
+  means *supplier*, and that pattern deleted 44 files of real service
+  code under `services/standard/misc/vendor/`. It is intentionally absent
+  from `BASE_EXCLUDES`; genuine third-party directories are excluded
+  per-project by explicit path. Always diff the indexed file list before
+  and after an exclude change.
+- **Changing excludes needs only an incremental sweep.** Excluded files
+  are skipped during the walk, so they never enter `seenKeys` and the
+  delete-on-disappearance pass removes them. `./bld scan <project>` is
+  enough — no `--full`.
+- **Import extraction lives in the indexer, not a separate pass.**
+  `RAGIndexer.storeDeps` runs inside `indexOneFile`, where the file has
+  already been read — so it costs nothing and can never go stale.
+  `./bld deps` exists only to backfill projects indexed before the graph
+  existed.
+- **The dependency graph is heuristic and says so.** Import targets are
+  matched by their last segment (class/module name), because real
+  resolution needs per-language module paths and a classpath. Every result
+  carries `confidence`: `exact` when the dotted target provably maps onto
+  the file's path, `name` when only the trailing name agrees. Do not
+  present `name` matches as certain.
+- **References must be classified, not just matched.** A raw lexeme match
+  answers "what calls this" badly: for `findJoinPath` it was 8 tests, 1
+  doc and the definition itself around a single real caller.
+  `findReferences` drops the defining chunk, labels each hit
+  `caller`/`test`/`doc`, marks likely invocations, and ranks in that
+  order. The `test` label doubles as "what covers this symbol".
+- **ctags has no Groovy parser.** Every Groovy file would silently get zero
+  definitions. `RAGDefs.LANGMAPS` maps `.groovy` onto the Java parser,
+  whose declaration syntax is close enough. Check `ctags --list-maps`
+  before assuming a language is covered.
+- **The Groovy vararg trap bites repeatedly.** `GroovyService.run` resolves
+  the target by the runtime classes of the trailing varargs, so growing the
+  argument list breaks the binding with an opaque `NoSuchMethodException`.
+  It has now caused three separate failures (`runJsonG`, `runJson`,
+  `ingestFiles`). **Cross-file Groovy entry points take exactly two
+  arguments: the Connection and one JSONObject of parameters.**
+- **`rag_chunk.symbol` is not a reliable definition index.** The chunker's
+  regex misses common declaration shapes — `public List<Edge> findJoinPath(...)`
+  is not matched, so that chunk is attributed to the previous method. Use
+  `rag_def` (ctags) for anything that needs to be correct about where a
+  symbol is defined.
+- **A retrieval score is only as honest as its expectations.** The first
+  stack360 eval read as a catastrophe (hit@1 0.257) and was almost
+  entirely an artifact of the query set naming one arbitrary file where
+  several were equally correct — the `.js`/`.html` twin of a screen, the
+  `Bxxx` business class vs the `xxx` bean. Fixing the expectations moved
+  hit@5 from 0.371 to 0.886. **Always inspect the misses before believing
+  a bad number**, and prefer `eval/mine.py` (real usage) over invented
+  queries.
+- **Weighted legs must contribute once per file, not once per match.**
+  `fuseSymbolSummaryLeg` originally added a score for every matching
+  symbol, so a large file with many mediocre matches outranked a file with
+  one excellent match — it halved hit@1 (0.62 → 0.24). Only a file's best
+  match may score.
+- **Do not run `./bld build` while the server is running.** It writes into
+  `tomcat/webapps`, Tomcat auto-redeploys, and any background job
+  (indexing, history, summarize) is killed mid-flight — the visible
+  symptom is a 404 on the next status poll. Stop, build, start.
+- **A long job cannot run inside the HTTP request.** The first stack360
+  history import outlived its request and Tomcat recycled the response
+  underneath it (`response object has been recycled`). `reindex`,
+  `history` and `summarize` all run on background threads behind the
+  per-project `reindex_running` lock and are polled via `status`.
+- **Fixed character caps on embedded text are not safe.** Subversion
+  paths tokenize far denser than prose; caps of 4000 and 2000 characters
+  both still overran the embedding context window. `RAGHistory.embedCommit`
+  halves and retries on rejection (as `RAGIndexer.embedBatch` already did)
+  and gives up on a single commit rather than failing a whole repository.
+- **Only the core `groovy-4.x.jar` is on the classpath** — no
+  `groovy-xml`, so `XmlSlurper` does not resolve in backend scripts. Use
+  the JDK DOM parser (see `RAGHistory.readSvn`).
+- **Never leave a valueless key in `application.ini`.** Writing
+  `RAGRerankModel =` with nothing after the `=` throws inside Kiss's ini
+  parser, which aborts `KissInit` entirely. The failure is silent and
+  deeply confusing downstream: no c3p0 pool, no auth allowlist, and every
+  service then receives a **null** `Connection` (`Cannot invoke method
+  fetchAll() on null object`). Comment the key out instead.
+- **Adding a parameter to a cross-file Groovy method can break dispatch.**
+  `GroovyService.run(...)` resolves the target by the runtime classes of
+  the trailing varargs, and `getMethod2` maps a null argument to
+  `Object.class`. Growing the argument list shifted the binding and
+  produced an opaque `NoSuchMethodException: runJsonG(java.lang.Object,
+  ...)`. Pass a single `JSONObject` of parameters instead — the signature
+  then stays stable as options accumulate (see `RAGEval.runJson`).
+- **An interrupted full rebuild used to look healthy.** `runFullRebuild`
+  TRUNCATEs first, so the index is partial until the sweep ends; the
+  `rebuild_required` flag is now *set* before the truncate and cleared
+  only on successful completion. Killing the server mid-rebuild (a plain
+  `./bld stop`) leaves the flag set, and the next incremental sweep
+  refuses rather than serving a half-populated index.
 - **Kiss `Connection.tableExists("schema.table")` caches by table name
   without schema** — gives stale results across schemas. Use a direct
   `information_schema.tables` query when checking per-schema. Already
@@ -201,6 +370,32 @@ project currently being indexed).
 - **The MCP server sets `hnsw.ef_search = 400` per query** — needed
   for good recall above ~10k chunks. Don't drop it back to pgvector's
   default 40 without checking.
+- **`rag_chunk.content` is the RAW chunk body; what gets embedded is
+  not.** `RAGIndexer.buildEmbedText` prepends a `repo:/file:/lang:/symbol:`
+  header before embedding, because a bare method body carries none of
+  the vocabulary a natural-language query uses. The header is retrieval
+  scaffolding only — it is never stored and never returned. Changing it
+  requires a full rebuild.
+- **The tokenizer is shared on purpose.** `RAGTokenizer` lives in
+  precompiled/ so the indexer (Groovy) and search (Java) apply identical
+  rules. If they diverge, the lexical leg stops matching and nothing
+  fails loudly.
+- **Rerank boosts must stay proportional.** `RAGSearch.rerank` scales the
+  symbol/path boost by `overlapFraction` — how much of the identifier the
+  query accounts for. An earlier any-token-overlap version fired on every
+  loosely related symbol and measurably pushed correct hits off the top
+  (hit@1 0.34 → 0.22).
+- **Do not penalize comment-heavy chunks.** An earlier boilerplate
+  detector counted `*` / `//` lines, which demoted javadoc-rich chunks —
+  the single richest natural-language description of what code does.
+  It cut vocab-query hit@5 from 0.73 to 0.47. The detector now matches
+  only import/package/include preamble.
+- **Kiss's default c3p0 pool is (cores × 4, min 20)** — 64 connections on
+  a 16-core box, for a tool serving one agent. Combined with any other
+  local PostgreSQL client that exhausts `max_connections` (default 100)
+  and the server fails to start with "sorry, too many clients already",
+  *after* which schema migrations silently do not run.
+  `application.ini` pins `DatabaseMaxPoolSize = 16`.
 - **Embed batching is byte-budgeted, not count-budgeted** — Ollama's
   `/api/embed` checks cumulative tokens across the whole input array.
   See `EmbeddingMaxBatchBytes` and the recursive-halving fallback in

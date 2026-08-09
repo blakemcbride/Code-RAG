@@ -181,3 +181,11 @@ node_modules/
 /Groovy.txt
 src/main/backend/FixPhoneNumbers.groovy
 src/main/backend/DB.sqlite.save
+
+# Eval run artifacts. The query sets and eval/baseline.json are the durable
+# part; every ./bld eval run drops a timestamped results file that is only
+# meaningful next to the run that produced it.
+eval/results-*.json
+eval/__pycache__/
+# Query set for a proprietary codebase — kept local, never published.
+eval/stack360-queries.jsonl
