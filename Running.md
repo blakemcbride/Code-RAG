@@ -101,8 +101,42 @@ journalctl --user -u code-rag -n 50     # why it isn't
 systemctl --user disable --now code-rag # undo
 ```
 
-With the service enabled, use `systemctl --user restart code-rag` rather
-than `./bld stop && ./bld start`, so systemd's view stays accurate.
+#### Pick one method, and stick to it
+
+Manual (`./bld start`) and systemd are two ways to run the same server, and
+mixing them is the one thing that will confuse you:
+
+- Start manually while the unit is also started and you get **two Tomcats
+  fighting for port 17080**.
+- Start manually and `systemctl --user status code-rag` reports **inactive**
+  even though the server is running perfectly. systemd only knows about
+  processes it launched. `./bld status` is the source of truth in every
+  case — it checks the port, not systemd.
+
+So with the service in use, drive it entirely through systemd
+(`systemctl --user restart code-rag`, not `./bld stop && ./bld start`), and
+when running manually, leave the unit disabled.
+
+#### Backing it out completely
+
+Disabling alone leaves the unit file and, if you enabled it, lingering. To
+return the machine to exactly how it was:
+
+```bash
+systemctl --user disable --now code-rag     # stop it and drop the autostart symlink
+rm ~/.config/systemd/user/code-rag.service  # remove the unit itself
+systemctl --user daemon-reload              # let systemd forget it
+loginctl disable-linger $USER               # only if you enabled it earlier
+```
+
+After that `systemctl --user is-enabled code-rag` should say `not-found`.
+Then start it by hand as in 1c.
+
+Note that lingering is only needed to survive **logging out**. Locking the
+screen keeps your session alive, so if you never actually log out, plain
+background processes (and the server started by `./bld start`) keep running
+without it — on a host where `KillUserProcesses` is `no`, which is the
+default on most distributions.
 
 ---
 
