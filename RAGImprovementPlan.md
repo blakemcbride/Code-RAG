@@ -174,6 +174,84 @@ Verified end to end.
 
 ---
 
+## 2026-08-21: adoption audit — the index works, almost nothing called it
+
+Prompted by a simple question: over the weeks since the last round, was any of
+this a benefit to Claude Code? The logging added above finally had data.
+
+**It was called five times.** Total, ever: 5 `search_code` calls, all on
+Aug 12, all in stack360, inside one four-hour span. The 9 `ownsona` rows are
+synthetic probes from testing this harness ("interstellar freight surcharge"),
+not usage. Claude Code transcripts agree exactly with `rag_query_log`.
+
+Against the same sessions and window, code search by grep:
+
+| window | grep/rg calls | search_code calls |
+|---|---:|---:|
+| server verifiably up | 2,212 | 5 |
+| server down | 1,839 | 0 |
+
+**442 greps per semantic search, even discounting the outage entirely.**
+
+Three separate causes, only one of which is about retrieval:
+
+1. **The server was down for 7 of 13 days** (Aug 13–20) and again when the
+   audit started. This is invisible from the agent's side — an MCP failure just
+   means the agent greps instead, silently. Fixed by shipping
+   `deploy/code-rag.service.example` (systemd user service, waits for
+   PostgreSQL and Ollama, starts at login).
+
+2. **The routing block was written where nobody launches Claude Code.** All 535
+   recent sessions started at `/home/blake/Stack360`, the umbrella directory,
+   while bld wrote `.mcp.json` + `CLAUDE.local.md` into the six *roots*
+   underneath. `project_dir` exists for exactly this and had never been set.
+   Note the honest correction: that directory *did* already have a valid
+   `.mcp.json` and a hand-written routing rule, so the tool was both visible
+   and instructed — and still lost 442:1. Discoverability was not the whole
+   story.
+
+3. **bld wrote its block into `CLAUDE.md`**, a file that in this install ends
+   with "This file should never be changed." Moved to `CLAUDE.local.md` (the
+   choice already made for roots), with automatic excision of any block left
+   behind in `CLAUDE.md`.
+
+**Turns-to-answer on stack360 — and a metric that lied in our favor.** Running
+`turns.py` against the 11,637-file, six-root corpus first reported *grep solved
+0% of queries* and a 59% call reduction. That was an artifact, not a result:
+`RESULT_CAP = 10` treats a result set larger than ten files as unusable, and at
+this scale one content word matches 169–1625 files ("accrual" 169, "password"
+392, "orgGroup" 1625). grep never failed to *find* the file; it failed to
+*narrow*. Collapsing those two into "solved 0%" overstates the tool's value,
+which is the direction a metric owner must be most suspicious of.
+
+`grep_cost` now separates them and charges the sift (ceil(n/2) Reads, capped at
+`MAX_SIFT = 10`):
+
+| | GREP | search_code |
+|---|---|---|
+| found the file at all | **100%** | 86% |
+| ...and narrowed to ≤10 | **0%** | 86% |
+| answered after ONE call | 0% | **86%** |
+| mean tool calls | 13.46 | **3.83** |
+
+The assumption-light finding is the middle row: on a corpus this size grep
+**never once** narrowed to an actionable set from natural-language terms, while
+`search_code` put a correct file in the top 5 on the first call 86% of the
+time. The 72% call reduction depends on the sift model and should be quoted
+with that caveat; the 0/35 does not.
+
+Two harness limitations fixed to get here: `turns.py` assumed a single repo
+root (stack360 has six, so no expected path resolved), and it re-grepped terms
+the single-term phase had already run — now memoized, which is why a run that
+would have taken an hour takes minutes. Call counts are unchanged.
+
+**What is still unanswered.** Why an agent with the tool visible, instructed,
+and demonstrably better on this corpus still reaches for grep 442 times out of
+443. That is a tool-selection question, not a retrieval question, and no amount
+of index tuning will answer it.
+
+---
+
 ## STATUS: Phases 0–4 complete (measured on the `kiss` corpus)
 
 | Metric | Baseline | Final | Factor |

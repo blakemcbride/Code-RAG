@@ -69,6 +69,41 @@ rm -f tomcat/bin/debug tomcat/bin/stopdebug
 ./bld -v start
 ```
 
+### 1d. Starting it automatically (recommended)
+
+Steps 1a–1c are easy to forget, and forgetting them is expensive in a way
+that is invisible from the agent's side: when the server is down, MCP calls
+simply fail and the agent falls back to Grep without saying so. Nothing
+warns you. On one measured 13-day window the server happened to be up for
+about 5 days, and every search in the remaining 8 silently didn't happen.
+
+`deploy/code-rag.service.example` is a systemd **user** service that starts
+Code-RAG at login and waits for PostgreSQL and Ollama first:
+
+```bash
+mkdir -p ~/.config/systemd/user
+sed "s|@CODE_RAG_HOME@|$(pwd)|g" deploy/code-rag.service.example \
+    > ~/.config/systemd/user/code-rag.service
+systemctl --user daemon-reload
+systemctl --user enable --now code-rag
+```
+
+A user service (not a system one) is deliberate: Code-RAG binds to
+loopback, reads your `~/.claude.json` / `~/.codex/config.toml`, and indexes
+trees in your home directory — as root it would register MCP entries in the
+wrong home and index files as the wrong owner.
+
+To also start it at boot without logging in: `sudo loginctl enable-linger $USER`.
+
+```bash
+systemctl --user status code-rag        # is it up?
+journalctl --user -u code-rag -n 50     # why it isn't
+systemctl --user disable --now code-rag # undo
+```
+
+With the service enabled, use `systemctl --user restart code-rag` rather
+than `./bld stop && ./bld start`, so systemd's view stays accurate.
+
 ---
 
 ## 2. Quick health check

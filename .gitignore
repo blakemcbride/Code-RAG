@@ -189,3 +189,7 @@ eval/results-*.json
 eval/__pycache__/
 # Query set for a proprietary codebase — kept local, never published.
 eval/stack360-queries.jsonl
+
+# Code-RAG local index files (written by bld; machine-local, not part of the project)
+.mcp.json
+CLAUDE.local.md

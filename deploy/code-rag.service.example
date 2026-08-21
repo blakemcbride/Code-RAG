@@ -1,0 +1,59 @@
+# Code-RAG as a systemd *user* service.
+#
+# Why this exists: the index is only useful if the server is actually up.
+# A measured 13-day window on the original install had the server running
+# for about 5 of those days; every MCP call in the gaps failed, and the
+# agent silently fell back to grep. Nothing about that is visible from the
+# client side, so the failure mode is "the tool quietly stopped existing".
+#
+# User service, not system: Code-RAG binds to loopback, reads the invoking
+# user's ~/.claude.json and ~/.codex/config.toml, and indexes trees under
+# that user's home. Running it as root would write MCP registrations to the
+# wrong home and index files as the wrong owner.
+#
+# Install (replace @CODE_RAG_HOME@ with your absolute install path):
+#
+#   mkdir -p ~/.config/systemd/user
+#   sed 's|@CODE_RAG_HOME@|/path/to/Code-RAG|g' \
+#       deploy/code-rag.service.example > ~/.config/systemd/user/code-rag.service
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now code-rag
+#
+# Starts at login. To start at boot without logging in as well:
+#   sudo loginctl enable-linger $USER
+#
+# Status / logs / removal:
+#   systemctl --user status code-rag
+#   journalctl --user -u code-rag -n 50
+#   systemctl --user disable --now code-rag
+
+[Unit]
+Description=Code-RAG — local semantic code search MCP server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Environment=CODE_RAG_HOME=@CODE_RAG_HOME@
+# systemd user services get a minimal PATH. bld shells out to java, psql,
+# ctags, curl and the MCP client CLIs (claude, codex); miss any of those and
+# the failure is a confusing partial start rather than a clean error.
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin
+WorkingDirectory=@CODE_RAG_HOME@
+
+# bld start refuses to launch when Ollama is unreachable, and Kiss aborts
+# startup when PostgreSQL is. At login both may still be coming up, so wait
+# rather than fail the unit and leave the server down until someone notices.
+ExecStartPre=/bin/bash -c 'for i in $(seq 1 60); do pg_isready -q && exit 0; sleep 2; done; echo "PostgreSQL not ready after 120s" >&2; exit 1'
+ExecStartPre=/bin/bash -c 'for i in $(seq 1 60); do curl -sf -o /dev/null http://127.0.0.1:11434/api/tags && exit 0; sleep 2; done; echo "Ollama not reachable after 120s" >&2; exit 1'
+
+ExecStart=@CODE_RAG_HOME@/bld start
+ExecStop=@CODE_RAG_HOME@/bld stop
+
+# 'bld start' compiles before launching; a cold build on a slow disk can
+# exceed systemd's 90s default and would be killed mid-build.
+TimeoutStartSec=900
+
+[Install]
+WantedBy=default.target

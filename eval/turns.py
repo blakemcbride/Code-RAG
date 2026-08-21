@@ -23,15 +23,21 @@ GREP numbers as an approximation. It is deliberately generous to grep: it is
 given the ideal term ordering (rarest first, which a real agent cannot know in
 advance) and unlimited case-insensitive matching.
 
-Usage:  python3 eval/turns.py <queries.jsonl> <repo-root> <mcp-url> <token>
+Usage:  python3 eval/turns.py <queries.jsonl> <root>[,<root>...] <mcp-url> <token>
+
+        <root> may be a comma-separated list when the project spans several
+        repositories (expected paths are resolved against whichever root
+        actually contains them).
 """
 import json
+import os
 import subprocess
 import sys
 import urllib.request
 
 RESULT_CAP = 10      # a result set larger than this is not directly actionable
 MAX_GREP_CALLS = 6   # give up after this many; agent would change tactics
+MAX_SIFT = 10        # Reads an agent will spend sifting an un-narrowed result set
 TOP_K = 5            # how many hits search_code returns
 
 STOP = set("""a an and are as at be been but by can could do does for from get gets
@@ -63,17 +69,28 @@ EXCLUDE_DIRS = [".git", "node_modules", "target", "build", "work", "dist",
                 "out", "tomcat", ".idea", ".vscode", "coverage", "vendor"]
 
 
-def rg_files(pattern, root):
+_RG_CACHE = {}
+
+
+def rg_files(pattern, roots):
     """Files containing a literal pattern, case-insensitive.
 
     Uses GNU grep rather than ripgrep: on this machine `rg` is only a shell
     function wrapping the Claude CLI, and a missing binary silently made every
     grep attempt fail, which would have scored the baseline at 0%.
+
+    Memoized: the two-term AND phase re-greps terms the single-term phase
+    already ran, so without a cache the same scan is repeated many times over
+    a large tree. This changes only wall-clock, never the reported call counts
+    (`calls` still counts every logical grep an agent would have issued).
     """
+    key = (pattern, tuple(roots))
+    if key in _RG_CACHE:
+        return _RG_CACHE[key]
     cmd = ["grep", "-rIl", "-i", "-F"]
     for d in EXCLUDE_DIRS:
         cmd.append("--exclude-dir=" + d)
-    cmd += ["--", pattern, root]
+    cmd += ["--", pattern] + list(roots)
     try:
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
     except Exception:
@@ -81,30 +98,61 @@ def rg_files(pattern, root):
     # grep exits 1 on "no match", which is not an error.
     if p.returncode not in (0, 1):
         raise RuntimeError("grep failed: " + p.stderr[:200])
-    return [l.strip() for l in p.stdout.splitlines() if l.strip()]
+    out = [l.strip() for l in p.stdout.splitlines() if l.strip()]
+    _RG_CACHE[key] = out
+    return out
 
 
-def grep_cost(query, expected_abs, root):
-    """grep calls needed before an expected file is in an actionable result set."""
+def grep_cost(query, expected_abs, roots):
+    """(calls, sift, narrowed) for grep, or None if it never matched at all.
+
+    Two distinct outcomes have to be told apart, because collapsing them
+    slanders grep at scale. On a large multi-repository corpus a single
+    content word routinely matches hundreds of files ("password" -> 392,
+    "orgGroup" -> 1625 across the six stack360 roots), so a rule of "the
+    result set must be <= RESULT_CAP to be actionable" reports grep as
+    solving 0% of queries -- which is false. grep FOUND the file; it just
+    could not narrow to a set worth reading one by one.
+
+      narrowed=True   the expected file is in a set of <= RESULT_CAP.
+                      Cost = calls + 1 Read.
+      narrowed=False  the expected file is in the matches, but the set is
+                      too big to act on directly. The agent must sift; with
+                      grep -l output in filesystem order the target sits on
+                      average halfway down, so charge ceil(n/2) Reads,
+                      capped at MAX_SIFT (past that a real agent changes
+                      tactics rather than reading on).
+    """
     ts = terms(query)
     calls = 0
-    # Single terms first.
+    best = None            # (calls, set_size) for the smallest matching set seen
+    def consider(c, hits):
+        nonlocal best
+        if hits and any(h in expected_abs for h in hits):
+            if best is None or len(hits) < best[1]:
+                best = (c, len(hits))
+            return len(hits) <= RESULT_CAP
+        return False
+
     for t in ts:
         if calls >= MAX_GREP_CALLS:
-            return None
+            break
         calls += 1
-        hits = rg_files(t, root)
-        if hits and len(hits) <= RESULT_CAP and any(h in expected_abs for h in hits):
-            return calls
+        if consider(calls, rg_files(t, roots)):
+            return (calls, 1, True)
     # Then two-term AND (approximated by intersecting two result sets).
     for i in range(len(ts)):
         for j in range(i + 1, len(ts)):
             if calls >= MAX_GREP_CALLS:
-                return None
+                break
             calls += 1
-            both = set(rg_files(ts[i], root)) & set(rg_files(ts[j], root))
-            if both and len(both) <= RESULT_CAP and any(h in expected_abs for h in both):
-                return calls
+            both = set(rg_files(ts[i], roots)) & set(rg_files(ts[j], roots))
+            if consider(calls, both):
+                return (calls, 1, True)
+        if calls >= MAX_GREP_CALLS:
+            break
+    if best is not None:
+        return (best[0], min(-(-best[1] // 2), MAX_SIFT), False)
     return None
 
 
@@ -122,41 +170,59 @@ def rag_rank(query, url, token, k):
 
 
 def main():
-    qfile, root, url, token = sys.argv[1:5]
+    qfile, rootarg, url, token = sys.argv[1:5]
+    # A project may span several repository roots (stack360 has six). Expected
+    # paths are stored relative to whichever root owns them, so resolve each
+    # against every root and keep the one that exists; grep sees all roots.
+    roots = [r.rstrip("/") for r in rootarg.split(",") if r.strip()]
+    for r in roots:
+        if not os.path.isdir(r):
+            sys.exit("not a directory: " + r)
     rows = [json.loads(l) for l in open(qfile) if l.strip()]
 
     grep_total = rag_total = 0
-    grep_solved = rag_solved = 0
+    grep_found = grep_narrowed = rag_solved = 0
     grep_one_call = rag_one_call = 0
     detail = []
 
     for r in rows:
         q = r["q"]
         rel = {e["path"] for e in r["expect"]}
-        absset = {root.rstrip("/") + "/" + p for p in rel}
-
-        gc = grep_cost(q, absset, root)
+        absset = set()
+        for p in rel:
+            for r in roots:
+                cand = r + "/" + p
+                if os.path.exists(cand):
+                    absset.add(cand)
+        gr = grep_cost(q, absset, roots)
         paths = rag_rank(q, url, token, TOP_K)
         hit = next((i + 1 for i, p in enumerate(paths) if p in rel), 0)
 
-        # GREP: grep calls + 1 Read, or the give-up ceiling.
-        g = (gc + 1) if gc else (MAX_GREP_CALLS + 1)
+        # GREP: grep calls + the Reads needed to actually get the file in hand.
+        if gr:
+            calls, sift, narrowed = gr
+            g = calls + sift
+        else:
+            calls, sift, narrowed = MAX_GREP_CALLS, 1, False
+            g = MAX_GREP_CALLS + 1
         # RAG: 1 search + 1 Read on a hit; otherwise pay the search AND the grep.
         rc = 2 if hit else (1 + g)
 
         grep_total += g
         rag_total += rc
-        grep_solved += 1 if gc else 0
+        grep_found += 1 if gr else 0
+        grep_narrowed += 1 if narrowed else 0
         rag_solved += 1 if hit else 0
-        grep_one_call += 1 if gc == 1 else 0
+        grep_one_call += 1 if (narrowed and calls == 1) else 0
         rag_one_call += 1 if hit else 0
-        detail.append((q, gc, hit, g, rc))
+        detail.append((q, gr, hit, g, rc))
 
     n = len(rows)
     print(f"\n{n} queries   (grep result cap {RESULT_CAP} files, give-up after {MAX_GREP_CALLS} calls)\n")
     print(f"  {'metric':<34}{'GREP':>10}{'search_code':>14}")
     print(f"  {'-'*58}")
-    print(f"  {'solved at all':<34}{grep_solved/n:>10.0%}{rag_solved/n:>14.0%}")
+    print(f"  {'found the file at all':<34}{grep_found/n:>10.0%}{rag_solved/n:>14.0%}")
+    print(f"  {'...and narrowed it to <=' + str(RESULT_CAP):<34}{grep_narrowed/n:>10.0%}{rag_solved/n:>14.0%}")
     print(f"  {'answer after ONE tool call':<34}{grep_one_call/n:>10.0%}{rag_one_call/n:>14.0%}")
     print(f"  {'mean tool calls to answer':<34}{grep_total/n:>10.2f}{rag_total/n:>14.2f}")
     print(f"\n  reduction in tool calls: {(1 - rag_total/grep_total):.0%}\n")
@@ -164,7 +230,7 @@ def main():
     worse = [d for d in detail if d[4] > d[3]]
     if worse:
         print(f"  queries where search_code cost MORE ({len(worse)}):")
-        for q, gc, hit, g, rc in worse[:10]:
+        for q, gr, hit, g, rc in worse[:10]:
             print(f"    grep={g} rag={rc}  \"{q[:60]}\"")
 
 

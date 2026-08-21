@@ -197,7 +197,7 @@ class RAGIndexer {
             }
             try {
                 storeDeps(db, project, r.getLong("file_id"),
-                          new String(f.bytes, StandardCharsets.UTF_8), lang)
+                          decodeText(f.bytes), lang)
                 done++
                 if (done % 500 == 0)
                     db.commit()
@@ -512,7 +512,7 @@ class RAGIndexer {
             stats.filesSkipped++
             return
         }
-        String content = new String(bytes, StandardCharsets.UTF_8)
+        String content = decodeText(bytes)
         String sha = sha256(bytes)
 
         if (existingRow != null && existingRow.sha256 == sha) {
@@ -1358,6 +1358,34 @@ class RAGIndexer {
     private static int estimateTokens(String s) {
         // 1 token ≈ 4 chars for English/code mix — good enough for sanity bookkeeping.
         return Math.max(1, s.length().intdiv(4))
+    }
+
+    /**
+     * A single NUL character, built without a unicode escape so nothing in the
+     * toolchain can quietly rewrite it.
+     */
+    private static final String NUL_CHAR = new String(new char[]{ (char) 0 })
+
+    /**
+     * Decode file bytes as UTF-8 with NUL characters removed.
+     * <br><br>
+     * PostgreSQL's {@code text} type cannot hold U+0000. An INSERT carrying one
+     * fails with {@code invalid byte sequence for encoding "UTF8": 0x00} and the
+     * entire file is lost -- not one chunk, the file. {@link #looksBinary}
+     * inspects only the first 8 KB (deliberately: reading every byte of every
+     * file just to classify it is wasteful), so a genuine text file with a stray
+     * NUL further in walks straight past it. RAGEval.groovy carries one at byte
+     * 9218 as a field separator; 16 files across the indexed corpus do something
+     * similar, mostly old Lisp and C sources.
+     * <br><br>
+     * Stripping rather than widening the binary check is the deliberate choice.
+     * These are real source files that belong in the index, one control
+     * character is no reason to discard the whole file, and a NUL can never
+     * appear in a query, so removing it costs no retrieval accuracy.
+     */
+    private static String decodeText(byte[] bytes) {
+        String s = new String(bytes, StandardCharsets.UTF_8)
+        return s.contains(NUL_CHAR) ? s.replace(NUL_CHAR, "") : s
     }
 
     private static boolean looksBinary(byte[] bytes) {

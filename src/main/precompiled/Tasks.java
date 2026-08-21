@@ -245,7 +245,7 @@ public class Tasks {
         println("                                          --full TRUNCATEs and rebuilds from scratch");
         println("new-project <name> [--project-dir <dir>] <root> [<root>...]");
         println("                                          add a project + bootstrap + register MCP entries");
-        println("                                          --project-dir <dir> drops .mcp.json + a CLAUDE.md");
+        println("                                          --project-dir <dir> drops .mcp.json + a CLAUDE.local.md");
         println("                                          routing snippet at <dir> so a Claude Code session");
         println("                                          launched from there (an umbrella directory above");
         println("                                          the roots) sees the MCP tool");
@@ -704,6 +704,15 @@ public class Tasks {
      * Stop the backend development server
      */
     public static void stop() {
+        // Sending SHUTDOWN to a port nothing is listening on makes Tomcat's
+        // Bootstrap throw, burying "it was already stopped" under a SEVERE
+        // stack trace. Check first and say so in one line instead.
+        String httpP = extractFromFile("tomcat/conf/server.xml",
+                "<Connector port=\"(\\d+)\" protocol=\"HTTP/1\\.1\"", httpPort);
+        if (!portListening("127.0.0.1", parseIntOr(httpP, 0))) {
+            println("Server is not running (nothing listening on port " + httpP + ") -- nothing to stop.");
+            return;
+        }
         println("shutting down tomcat");
         if (isWindows)
             runWait(true, "tomcat\\bin\\stopdebug.cmd");
@@ -1651,7 +1660,7 @@ public class Tasks {
             System.exit(1);
         }
         // Capture roots + project_dir before mutating cfg — we need them to
-        // know which .mcp.json files (and which CLAUDE.md block) to clean up
+        // know which .mcp.json files (and which CLAUDE.local.md block) to clean up
         // after the project is gone from the JSON.
         JSONObject existingProj = findProject(cfg, name);
         JSONArray departingRoots = existingProj.getJSONArray("roots");
@@ -1723,7 +1732,7 @@ public class Tasks {
         // have their .mcp.json from new-project (or a previous bld start
         // migration pass), so we only register the new ones. The project_dir
         // (if any) is also already registered — pass null so we don't
-        // re-write the CLAUDE.md block on every add-root.
+        // re-write the CLAUDE.local.md block on every add-root.
         registerMcpEntries(name, newRoots, null);
     }
 
@@ -1988,7 +1997,7 @@ public class Tasks {
      *   <li>must not equal any configured root (would duplicate the
      *       .mcp.json that's already written there)</li>
      *   <li>must not be {@code $HOME} or {@code /} — both are too
-     *       broad to safely drop a managed CLAUDE.md block into</li>
+     *       broad to safely drop a managed CLAUDE.local.md block into</li>
      * </ul>
      */
     private static String validateProjectDir(String raw, JSONArray roots) {
@@ -2007,7 +2016,7 @@ public class Tasks {
         String home = System.getProperty("user.home");
         if (abs.equals(home) || abs.equals("/")) {
             System.err.println("--project-dir refuses '" + abs
-                    + "': too broad to drop a managed CLAUDE.md block into.");
+                    + "': too broad to drop a managed CLAUDE.local.md block into.");
             return null;
         }
         if (roots != null) {
@@ -2022,11 +2031,11 @@ public class Tasks {
         return abs;
     }
 
-    // ----- CLAUDE.md managed block (at project_dir) -----
+    // ----- CLAUDE.local.md managed block (at project_dir) -----
 
     /**
      * When project_dir is set, bld drops a managed block into
-     * {@code <project_dir>/CLAUDE.md} that biases Claude Code toward
+     * {@code <project_dir>/CLAUDE.local.md} that biases Claude Code toward
      * the MCP search_code tool for conceptual queries and toward Grep
      * for literal-token lookups. Without this block the .mcp.json
      * alone tends not to shift Claude Code's tool-selection heuristics
@@ -2034,7 +2043,7 @@ public class Tasks {
      *
      * <p>The block is delimited by stable HTML comments so we can find
      * and rewrite (or excise) it on subsequent runs. Anything outside
-     * the markers — including a user's hand-written CLAUDE.md content —
+     * the markers — including a user's hand-written content —
      * is left untouched.</p>
      */
     private static final String CLAUDE_MD_BLOCK_BEGIN =
@@ -2070,14 +2079,22 @@ public class Tasks {
             "few minutes, so your own new code is otherwise invisible to `search_code`.\n";
 
     /**
-     * Create or update {@code <projectDir>/CLAUDE.md} so it contains the
+     * Create or update {@code <projectDir>/CLAUDE.local.md} so it contains the
      * managed block. If the file does not exist, it is created containing
      * only the block. If it exists and already contains the markers, the
      * block between them is replaced (preserving everything outside).
      * Otherwise the block is appended.
      */
     private static void writeClaudeMdBlock(java.io.File projectDir) {
-        writeManagedBlock(new java.io.File(projectDir, "CLAUDE.md"));
+        // CLAUDE.local.md, not CLAUDE.md -- the same choice already made for
+        // indexed roots. CLAUDE.md is routinely committed and hand-maintained,
+        // and some repositories explicitly forbid editing it; this block is a
+        // fact about THIS machine's local index, so it belongs in the
+        // local-only file. Excise any block an earlier release left behind in
+        // CLAUDE.md so the migration happens automatically rather than
+        // orphaning a block bld no longer manages.
+        removeManagedBlock(new java.io.File(projectDir, "CLAUDE.md"));
+        writeManagedBlock(new java.io.File(projectDir, "CLAUDE.local.md"));
     }
 
     /**
@@ -2132,12 +2149,22 @@ public class Tasks {
     }
 
     /**
-     * Excise the managed block from {@code <projectDir>/CLAUDE.md} (no-op
+     * Excise the managed block from the project_dir routing files (no-op
      * if either the file or the markers are absent). If removing the
      * block leaves the file effectively empty, the file is deleted.
      */
     private static void removeClaudeMdBlock(java.io.File projectDir) {
-        java.io.File md = new java.io.File(projectDir, "CLAUDE.md");
+        removeManagedBlock(new java.io.File(projectDir, "CLAUDE.local.md"));
+        // Legacy location, written by releases before the block moved.
+        removeManagedBlock(new java.io.File(projectDir, "CLAUDE.md"));
+    }
+
+    /**
+     * Excise the managed block from an explicit markdown file (no-op if either
+     * the file or the markers are absent). If removing the block leaves the
+     * file effectively empty, the file is deleted.
+     */
+    private static void removeManagedBlock(java.io.File md) {
         if (!md.exists())
             return;
         String existing;

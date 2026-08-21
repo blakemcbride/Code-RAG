@@ -65,6 +65,7 @@ are authoritative — update them rather than reinventing.
 | `src/main/backend/rag-projects.json.example` | Projects template (committed) |
 | `src/main/backend/rag-projects.json` | Live projects list (**gitignored**) |
 | `setup.sh` | First-run setup — copies `.example` → real config + generates random shared secret |
+| `deploy/code-rag.service.example` | systemd **user** service template (start at login, waits for PostgreSQL + Ollama). The server being down is invisible to the agent — it just falls back to Grep — so autostart is the fix for the failure mode that costs the most |
 | `code-rag` | Top-level shell wrapper — `cd $CODE_RAG_HOME && exec ./bld "$@"`. Lets `bld` tasks be invoked from any cwd. Requires only `CODE_RAG_HOME`; everything else is handled by `bld`. Defines one wrapper-only subcommand: `code-rag monitor` runs `watch -n 1 'echo; nvidia-smi; ollama ps'` for a live GPU + Ollama view (Ctrl-C exits). `monitor` is **not** a bld task — it exists only here. |
 
 ## Don't modify (Kiss framework code)
@@ -107,7 +108,7 @@ python3 eval/mine.py <project>                    # candidate query-set entries 
 ./bld new-project <name> [--project-dir <dir>] <root> [<root>...]
                                                   # add a project, scan it, auto-register MCP entries with Claude Code / Codex
                                                   # --project-dir <dir>: umbrella directory above the roots (NOT indexed);
-                                                  #   bld drops a .mcp.json there and a managed CLAUDE.md routing snippet
+                                                  #   bld drops a .mcp.json there and a managed CLAUDE.local.md routing snippet
 ./bld remove-project <name>                       # drop a project (refuses on last one), auto-deregister MCP entries
 ./bld add-root <name> <root> [<root>...]          # add roots to an existing project + scan
 ./bld remove-root <name> <root> [<root>...]       # remove roots from a project + scan
@@ -142,14 +143,19 @@ directory that sits *above* the configured roots. When set, bld
 treats it as an additional `.mcp.json` write target (so a Claude
 Code session launched from the umbrella sees the MCP tool), and
 also writes a marker-delimited managed block into
-`<project_dir>/CLAUDE.md` containing a Grep-vs-`search_code` routing
+`<project_dir>/CLAUDE.local.md` containing a Grep-vs-`search_code` routing
 rule (so Claude Code prefers `search_code` for conceptual queries
 rather than defaulting to Grep). `project_dir` is **not** indexed —
 only `roots[]` get scanned. `--project-dir <dir>` sets it on
 `new-project`; for existing projects, hand-edit `rag-projects.json`
 and run `./bld stop && ./bld start`. Validation refuses `$HOME`,
-`/`, and any path equal to one of the roots. `bld remove-project`
-removes both the `.mcp.json` and the CLAUDE.md managed block at
+`/`, and any path equal to one of the roots. The block goes in
+`CLAUDE.local.md`, never `CLAUDE.md`: `CLAUDE.md` is routinely committed,
+hand-maintained, and sometimes explicitly marked do-not-edit, while this
+block is a fact about *this machine's* local index. `writeClaudeMdBlock`
+also excises any block an earlier release left in `CLAUDE.md`, so the
+migration is automatic. `bld remove-project`
+removes both the `.mcp.json` and the CLAUDE.local.md managed block at
 `project_dir`. Removing `project_dir` from the JSON without
 `remove-project` leaves the previously-written files orphaned.
 
@@ -408,6 +414,20 @@ search would give.
   and the server fails to start with "sorry, too many clients already",
   *after* which schema migrations silently do not run.
   `application.ini` pins `DatabaseMaxPoolSize = 16`.
+- **A NUL byte anywhere past 8 KB used to lose the whole file.** PostgreSQL
+  `text` cannot hold U+0000; an INSERT carrying one fails with `invalid byte
+  sequence for encoding "UTF8": 0x00` and the *file* is lost, not just a chunk.
+  `looksBinary` only inspects the first 8192 bytes — deliberately, since reading
+  every byte of every file to classify it is wasteful — so a real source file
+  with a stray NUL further in sails past it and then dies at insert time. This
+  was silent: 135 logged failures across 16 files (old Lisp/C trees, plus
+  `RAGEval.groovy`, which uses a NUL as a field separator at byte 9218).
+  `decodeText` now strips NULs after decoding. Stripping, not widening the
+  binary check: these are genuine sources that belong in the index, and a NUL
+  can never appear in a query, so removing it costs no accuracy. Files that are
+  *actually* binary still get caught, because their NUL is in the first 8 KB
+  (`m16.asm` at byte 2). `amigastu.c` had its NUL at byte 8192 exactly — one
+  past the window — which is how narrow the old gap was.
 - **Embed batching is byte-budgeted, not count-budgeted** — Ollama's
   `/api/embed` checks cumulative tokens across the whole input array.
   See `EmbeddingMaxBatchBytes` and the recursive-halving fallback in
