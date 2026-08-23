@@ -619,6 +619,15 @@ public class Tasks {
     private static final String ALL_MCP_NAME = "code_rag_all";
 
     /**
+     * URL path segment for the cross-project endpoint. Deliberately not a
+     * legal project name (leading underscore), so it never collides with a
+     * real project — see RAGMCPServer.ALL_PROJECTS. Status reporting has to
+     * special-case it: it is a first-class endpoint bld registers itself,
+     * not a project, so it will never appear in rag-projects.json.
+     */
+    private static final String ALL_PROJECT_SEGMENT = "_all";
+
+    /**
      * Re-assert the cross-project ({@code /rag-mcp/_all}) registration.
      *
      * Registered at USER scope for Claude Code rather than per-root: a tool
@@ -630,7 +639,7 @@ public class Tasks {
      * sending the old token, failing 401 with no obvious cause.
      */
     private static void reassertAllProjectsEntry(boolean hasClaude, boolean hasCodex) {
-        String url = MCP_BASE_URL + "/" + "_all";
+        String url = MCP_BASE_URL + "/" + ALL_PROJECT_SEGMENT;
         String secret = readSharedSecret();
         if (secret == null || secret.isEmpty())
             return;
@@ -2683,6 +2692,23 @@ public class Tasks {
             }
         }
 
+        // The cross-project endpoint gets its own block: '_all' is not a
+        // project, so bucketByProject can never place it and the stale/orphan
+        // section would otherwise flag bld's own registration every run.
+        java.util.List<ClientEntry> claudeAllEp = allProjectsEntries(claudeAll, httpP);
+        java.util.List<ClientEntry> codexAllEp  = allProjectsEntries(codexAll, httpP);
+        println("");
+        println("  Cross-project endpoint (/rag-mcp/" + ALL_PROJECT_SEGMENT
+                + " — one tool that searches every project at once):");
+        if (claudeAllEp.isEmpty() && codexAllEp.isEmpty()) {
+            println("      (not registered — 'code-rag start' re-registers it)");
+        } else {
+            for (ClientEntry e : claudeAllEp)
+                printAllEndpointLines("Claude Code", e, true);
+            for (ClientEntry e : codexAllEp)
+                printAllEndpointLines("Codex", e, false);
+        }
+
         if (!claudeStranded.isEmpty() || !codexStranded.isEmpty()) {
             println("");
             println("  Stale / orphan MCP entries (URL is rag-mcp but does not match a current project on this server):");
@@ -2711,6 +2737,24 @@ public class Tasks {
             println(String.format("      %-13s '%s'", clientLabel + ":", e.name));
             println("                    " + visibilityNote(e, cwdScoped));
         }
+    }
+
+    /**
+     * Lines for the cross-project entry. Unlike a per-project entry, user
+     * (Claude Code) / global (Codex) scope is the CORRECT shape here — a tool
+     * whose whole purpose is finding code in a repository you are not in is
+     * useless if it is only visible from inside those repositories. Anything
+     * narrower is therefore worth flagging.
+     */
+    private static void printAllEndpointLines(String clientLabel, ClientEntry e, boolean cwdScoped) {
+        println(String.format("      %-13s '%s' → %s", clientLabel + ":", e.name, e.urlString()));
+        if (!cwdScoped)
+            println("                    (global — visible to any Codex session)");
+        else if ("user".equals(e.scope))
+            println("                    (user scope — visible from any directory)");
+        else
+            println("                    " + visibilityNote(e, true)
+                    + "\n                    ⚠ should be user scope — 'code-rag start' re-registers it");
     }
 
     /** Multi-line block in the stranded section: entry + URL + visibility + reason. */
@@ -2757,7 +2801,11 @@ public class Tasks {
         return out;
     }
 
-    /** Anything not in the bucketByProject result: stale port, wrong project, or no project at all. */
+    /**
+     * Anything not in the bucketByProject result: stale port, wrong project,
+     * or no project at all. The cross-project endpoint is excluded — it is a
+     * live endpoint bld registers itself, reported by {@link #allProjectsEntries}.
+     */
     private static java.util.List<ClientEntry> strandedEntries(
             java.util.List<ClientEntry> entries, String currentPort,
             java.util.Set<String> knownProjects) {
@@ -2765,9 +2813,20 @@ public class Tasks {
         for (ClientEntry e : entries) {
             boolean good = currentPort.equals(e.urlPort)
                     && !e.urlProject.isEmpty()
-                    && knownProjects.contains(e.urlProject);
+                    && (knownProjects.contains(e.urlProject)
+                        || ALL_PROJECT_SEGMENT.equals(e.urlProject));
             if (!good) out.add(e);
         }
+        return out;
+    }
+
+    /** Entries on the current port that target the cross-project endpoint. */
+    private static java.util.List<ClientEntry> allProjectsEntries(
+            java.util.List<ClientEntry> entries, String currentPort) {
+        java.util.List<ClientEntry> out = new java.util.ArrayList<>();
+        for (ClientEntry e : entries)
+            if (currentPort.equals(e.urlPort) && ALL_PROJECT_SEGMENT.equals(e.urlProject))
+                out.add(e);
         return out;
     }
 
@@ -2891,6 +2950,62 @@ public class Tasks {
     }
 
     /**
+     * Key path (outermost → innermost) of the JSON object containing
+     * {@code pos}. Tasks.java intentionally carries no JSON dependency, so
+     * this is a minimal brace scanner: it tracks the key each open brace was
+     * introduced by, honouring quoted strings and backslash escapes so braces
+     * inside string values do not disturb the nesting. Array elements push an
+     * empty key. The root object is the first, empty-keyed element.
+     */
+    private static java.util.List<String> jsonKeyPathAt(String content, int pos) {
+        java.util.ArrayDeque<String> stack = new java.util.ArrayDeque<>();
+        String pendingKey = null, lastString = null;
+        StringBuilder cur = null;
+        boolean inString = false, escaped = false;
+        int end = Math.min(pos, content.length());
+        for (int i = 0; i < end; i++) {
+            char ch = content.charAt(i);
+            if (inString) {
+                if (escaped)          { escaped = false; cur.append(ch); }
+                else if (ch == '\\') escaped = true;
+                else if (ch == '"')   { inString = false; lastString = cur.toString(); cur = null; }
+                else                  cur.append(ch);
+                continue;
+            }
+            switch (ch) {
+                case '"': inString = true; cur = new StringBuilder(); break;
+                case ':': pendingKey = lastString; break;
+                case ',': pendingKey = null; break;
+                case '{': case '[':
+                    stack.push(pendingKey == null ? "" : pendingKey);
+                    pendingKey = null;
+                    break;
+                case '}': case ']':
+                    if (!stack.isEmpty()) stack.pop();
+                    pendingKey = null;
+                    break;
+                default: break;
+            }
+        }
+        java.util.List<String> out = new java.util.ArrayList<>(stack); // innermost first
+        java.util.Collections.reverse(out);
+        return out;
+    }
+
+    /**
+     * The MCP entry name from a key path produced by {@link #jsonKeyPathAt} —
+     * the key one level inside the innermost "mcpServers" object. Null when
+     * the position is not inside an mcpServers block at all.
+     */
+    private static String mcpEntryNameAt(java.util.List<String> keyPath) {
+        int mcpIdx = keyPath.lastIndexOf("mcpServers");
+        if (mcpIdx < 0 || mcpIdx + 1 >= keyPath.size())
+            return null;
+        String name = keyPath.get(mcpIdx + 1);
+        return name.isEmpty() ? null : name;
+    }
+
+    /**
      * Scan a Claude Code config file for MCP server entries whose URL targets
      * any port at <code>http://127.0.0.1:&lt;port&gt;/rag-mcp[/&lt;project&gt;]</code>.
      * Returns the full list — caller filters by current-port-and-known-project
@@ -2906,31 +3021,27 @@ public class Tasks {
             // Match any rag-mcp URL regardless of port, with optional project segment.
             java.util.regex.Pattern urlPat = java.util.regex.Pattern.compile(
                     "http://127\\.0\\.0\\.1:(\\d+)/rag-mcp(?:/([a-zA-Z0-9_.-]+))?");
-            java.util.regex.Pattern namePat =
-                    java.util.regex.Pattern.compile("\"([a-zA-Z0-9_.-]+)\"\\s*:\\s*\\{");
-            java.util.regex.Pattern pathKeyPat =
-                    java.util.regex.Pattern.compile("\"(/[^\"]+)\"\\s*:\\s*\\{");
             java.util.regex.Matcher um = urlPat.matcher(content);
             while (um.find()) {
                 String port = um.group(1);
                 String project = um.group(2); // may be null
-                int hit = um.start();
-                String beforeUrl = content.substring(0, hit);
-                // Most recent `"<name>": {` is the entry name.
-                java.util.regex.Matcher m = namePat.matcher(beforeUrl);
-                String lastName = null;
-                while (m.find()) lastName = m.group(1);
-                if (lastName == null) continue;
-                // Most recent `"mcpServers"` before that defines scope.
-                int mcpServersPos = beforeUrl.lastIndexOf("\"mcpServers\"");
+                // Both the entry name and the scope come from the key path of
+                // the object holding this URL. Guessing from the nearest
+                // preceding key gets both wrong: Claude Code writes the
+                // user-scope "mcpServers" block AFTER the "projects" map, so
+                // the nearest preceding path key belongs to an unrelated
+                // project and every user-scope entry reads as local scope.
+                //   user scope:  [ "", "mcpServers", "<name>" ]
+                //   local scope: [ "", "projects", "<dir>", "mcpServers", "<name>" ]
+                java.util.List<String> keyPath = jsonKeyPathAt(content, um.start());
+                String name = mcpEntryNameAt(keyPath);
+                if (name == null) continue;
+                int mcpIdx = keyPath.lastIndexOf("mcpServers");
                 String regUnder = null;
-                if (mcpServersPos > 0) {
-                    String beforeMcp = beforeUrl.substring(0, mcpServersPos);
-                    java.util.regex.Matcher pm = pathKeyPat.matcher(beforeMcp);
-                    while (pm.find()) regUnder = pm.group(1);
-                }
+                if (mcpIdx >= 2 && "projects".equals(keyPath.get(mcpIdx - 2)))
+                    regUnder = keyPath.get(mcpIdx - 1);
                 String scope = (regUnder == null) ? "user" : "local";
-                out.add(new ClientEntry(lastName, regUnder, scope, port, project));
+                out.add(new ClientEntry(name, regUnder, scope, port, project));
             }
         } catch (java.io.IOException ignored) {}
         return out;
@@ -2962,19 +3073,17 @@ public class Tasks {
                                             java.nio.charset.StandardCharsets.UTF_8);
                 java.util.regex.Pattern urlPat = java.util.regex.Pattern.compile(
                         "http://127\\.0\\.0\\.1:(\\d+)/rag-mcp(?:/([a-zA-Z0-9_.-]+))?");
-                java.util.regex.Pattern namePat =
-                        java.util.regex.Pattern.compile("\"([a-zA-Z0-9_.-]+)\"\\s*:\\s*\\{");
                 java.util.regex.Matcher um = urlPat.matcher(content);
                 while (um.find()) {
                     String port = um.group(1);
                     String project = um.group(2);
-                    String before = content.substring(0, um.start());
-                    java.util.regex.Matcher m = namePat.matcher(before);
-                    String lastName = null;
-                    while (m.find()) lastName = m.group(1);
-                    if (lastName == null)
+                    // Key path rather than nearest-preceding-key: an entry that
+                    // lists "headers" before "url" would otherwise be reported
+                    // under the name "headers".
+                    String name = mcpEntryNameAt(jsonKeyPathAt(content, um.start()));
+                    if (name == null)
                         continue;
-                    out.add(new ClientEntry(lastName, root, "project", port, project));
+                    out.add(new ClientEntry(name, root, "project", port, project));
                 }
             } catch (java.io.IOException ignored) {}
         }
