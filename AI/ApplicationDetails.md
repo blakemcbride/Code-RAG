@@ -102,6 +102,8 @@ python3 eval/turns.py <queries> <root> <url> <tok> # tool calls to answer: searc
 ./bld defs <project|all>                          # extract ctags symbol definitions (find_symbol)
 ./bld deps <project|all>                          # backfill the import graph (find_dependents)
 ./bld usage <project|all>                         # is anything actually calling the tool?
+./bld routing-rules                               # rewrite the CLAUDE.local.md routing blocks now
+                                                  #   (otherwise they refresh only on 'bld start')
 python3 eval/mine.py <project>                    # candidate query-set entries from real usage
                                                   #   eval diffs against eval/baseline.json when present and
                                                   #   reports per-query rank movements. Server must be running.

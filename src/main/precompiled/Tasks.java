@@ -256,6 +256,8 @@ public class Tasks {
         println("defs <project|all>                        extract ctags symbol definitions (find_symbol)");
         println("deps <project|all>                        backfill the import graph (find_dependents)");
         println("usage <project|all>                       is the tool actually being called? (from rag_query_log)");
+        println("routing-rules                             rewrite the CLAUDE.local.md routing blocks now");
+        println("                                          (otherwise they refresh only on 'bld start')");
         println("summarize <project|all> [--regenerate]    generate per-file LLM summaries (slow, GPU-bound)");
         println("summarize <project|all> --symbols       per-symbol summaries for large files (slower)");
         println("eval <project> [--baseline]               score retrieval against eval/<project>-queries.jsonl");
@@ -610,6 +612,27 @@ public class Tasks {
                 writeRoutingRule(new java.io.File(root));
             }
         }
+    }
+
+    /**
+     * bld task: rewrite the routing block in every configured root and
+     * project_dir without touching the server. Exists because the block
+     * otherwise only propagates on 'bld start', and with manual start/stop a
+     * text change would sit dormant until the next restart.
+     */
+    public static void routingRules() {
+        writeRoutingRules();
+        JSONObject cfg = loadProjectsJson();
+        if (cfg == null)
+            return;
+        JSONArray projects = cfg.getJSONArray("projects");
+        for (int i = 0; i < projects.length(); i++) {
+            JSONObject p = projects.getJSONObject(i);
+            String projectDir = p.has("project_dir") ? p.getString("project_dir", null) : null;
+            if (projectDir != null && !projectDir.isEmpty())
+                writeClaudeMdBlock(new java.io.File(projectDir));
+        }
+        println("routing blocks are up to date (unchanged files are not rewritten).");
     }
 
     /**
@@ -2135,6 +2158,12 @@ public class Tasks {
             "- You want to know WHY something is the way it is, when it changed, or\n" +
             "  what moved with it → **`search_history`** (indexed git and Subversion\n" +
             "  commit messages). No amount of reading the tree answers this.\n" +
+            "- You know the exact symbol and want where it is DEFINED, what CALLS it,\n" +
+            "  or what tests cover it → **`find_symbol`** (ctags definitions plus\n" +
+            "  classified references: caller/test/doc). Before editing a file, use\n" +
+            "  **`find_dependents`** to see which files import it — what breaks if you\n" +
+            "  change it. Both beat Grep: they classify and rank instead of dumping\n" +
+            "  every textual match.\n" +
             "\n" +
             "`search_code` returns ranked FILES by default, each with the symbols that\n" +
             "matched and an excerpt already widened to the whole enclosing function, so\n" +
