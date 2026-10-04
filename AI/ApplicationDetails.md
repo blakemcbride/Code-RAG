@@ -137,27 +137,38 @@ releases. Codex has no project-scope concept — its
 and Code-RAG writes them that way (the speculative-query problem
 still exists for Codex; tracked as a follow-up).
 
-**`project_dir`: umbrella directory above the roots.** A project
-entry may carry an optional `project_dir` field — an absolute
-directory that sits *above* the configured roots. When set, bld
-treats it as an additional `.mcp.json` write target (so a Claude
-Code session launched from the umbrella sees the MCP tool), and
-also writes a marker-delimited managed block into
-`<project_dir>/CLAUDE.local.md` containing a Grep-vs-`search_code` routing
-rule (so Claude Code prefers `search_code` for conceptual queries
-rather than defaulting to Grep). `project_dir` is **not** indexed —
-only `roots[]` get scanned. `--project-dir <dir>` sets it on
-`new-project`; for existing projects, hand-edit `rag-projects.json`
-and run `./bld stop && ./bld start`. Validation refuses `$HOME`,
-`/`, and any path equal to one of the roots. The block goes in
+**The routing block goes into every root.** `bld start`
+(`writeRoutingRules`), `new-project`, and `add-root` write a
+marker-delimited managed block into `<root>/CLAUDE.local.md` of **every
+configured root**, containing a Grep-vs-`search_code` routing rule (so
+Claude Code prefers `search_code` for conceptual queries rather than
+defaulting to Grep) and an instruction to tell the user when the MCP
+connection is down rather than silently falling back to Grep — with
+manual start/stop, a forgotten `code-rag start` is otherwise invisible.
+The `.mcp.json` alone does not shift Claude Code's tool-selection
+habits; without the block the whole system goes unused in practice.
+Disable with `RAGWriteRoutingRules = false` in `application.ini`.
+`remove-root` and `remove-project` excise the block from departing
+directories unless another configured project still claims them
+(`removeRoutingRules` / `dirStillConfigured`). The block goes in
 `CLAUDE.local.md`, never `CLAUDE.md`: `CLAUDE.md` is routinely committed,
 hand-maintained, and sometimes explicitly marked do-not-edit, while this
 block is a fact about *this machine's* local index. `writeClaudeMdBlock`
 also excises any block an earlier release left in `CLAUDE.md`, so the
-migration is automatic. `bld remove-project`
-removes both the `.mcp.json` and the CLAUDE.local.md managed block at
-`project_dir`. Removing `project_dir` from the JSON without
-`remove-project` leaves the previously-written files orphaned.
+migration is automatic.
+
+**`project_dir`: umbrella directory above the roots.** A project
+entry may carry an optional `project_dir` field — an absolute
+directory that sits *above* the configured roots. When set, bld
+treats it as an additional `.mcp.json` write target (so a Claude
+Code session launched from the umbrella sees the MCP tool) and an
+additional routing-block target. `project_dir` is **not** indexed —
+only `roots[]` get scanned. `--project-dir <dir>` sets it on
+`new-project`; for existing projects, hand-edit `rag-projects.json`
+and run `./bld stop && ./bld start`. Validation refuses `$HOME`,
+`/`, and any path equal to one of the roots. Removing `project_dir`
+from the JSON without `remove-project` leaves the previously-written
+files orphaned.
 
 `./bld scan` always reconciles DB state with `rag-projects.json` before
 scanning: creates schemas for new projects, drops schemas for removed
@@ -180,7 +191,18 @@ every `./bld start` so per-invocation overrides "stick" for that run.
   `DatabaseName`).
 - One schema per project. Schema name = project name in
   `rag-projects.json` (validated `[a-z][a-z0-9_]*`).
-- Three tables per project: `rag_file`, `rag_chunk`, `rag_meta`.
+- Tables per project: `rag_file`, `rag_chunk`, `rag_meta`, `rag_commit`
+  (history), `rag_def` / `rag_dep` (structural index), `rag_symbol`
+  (per-symbol summaries), `rag_query_log` (usage).
+- **Every MCP tool call logs to `rag_query_log`** (`RAGSearch.logUsage`;
+  disable with `RAGLogQueries = false`). Kinds: `search` (search_code,
+  search_history, find_symbol, find_dependents — `paths` holds what came
+  back, empty on a miss), `fetch` (get_chunk), `admin` (reindex_path,
+  list_repos, index_status). `_all` fan-outs log into each project that
+  contributed results (there is no `_all` schema), so a cross-project
+  query nothing matched leaves no row; list_repos/index_status log only
+  on per-project endpoints. `./bld usage` reports a per-tool breakdown;
+  `eval/mine.py` mines only search_code→get_chunk pairs.
 - `rag_file.path` is stored **relative to the project root**, not
   absolute. Absolute paths are recomputed at query time from
   `rag-projects.json`'s `roots[]`.

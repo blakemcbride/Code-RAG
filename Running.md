@@ -309,7 +309,8 @@ Add `--symbols` to `summarize` for per-symbol summaries of large files
 ```
 
 Reads the query log and reports searches per day, how often a result was
-actually opened, zero-result queries, and your most frequent searches.
+actually opened, zero-result queries, a per-tool breakdown (every MCP
+tool logs, not just `search_code`), and your most frequent searches.
 Retrieval scores say the tool *can* find things; this says whether Claude
 Code is asking it to. If searches stay at zero, fix the routing block in
 `<root>/CLAUDE.local.md` before tuning anything.

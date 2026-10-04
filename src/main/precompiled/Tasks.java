@@ -607,11 +607,61 @@ public class Tasks {
                 String root = roots.getString(j);
                 if (root == null || root.isEmpty() || !done.add(root))
                     continue;
-                java.io.File dir = new java.io.File(root);
-                if (!dir.isDirectory())
-                    continue;
-                writeManagedBlock(new java.io.File(dir, "CLAUDE.local.md"));
+                writeRoutingRule(new java.io.File(root));
             }
+        }
+    }
+
+    /**
+     * Write the routing block into one directory's CLAUDE.local.md.
+     * No-op when the directory is missing or RAGWriteRoutingRules=false.
+     */
+    private static void writeRoutingRule(java.io.File dir) {
+        if (!"true".equalsIgnoreCase(readIniValue("RAGWriteRoutingRules", "true")))
+            return;
+        if (!dir.isDirectory())
+            return;
+        writeManagedBlock(new java.io.File(dir, "CLAUDE.local.md"));
+    }
+
+    /**
+     * True when the directory is still configured somewhere in
+     * rag-projects.json — as a root or project_dir of any project. Checked
+     * before excising a routing block from a departing directory, so a
+     * directory shared with a surviving project keeps its block. Call only
+     * after the mutated rag-projects.json has been saved.
+     */
+    private static boolean dirStillConfigured(String path) {
+        JSONObject cfg = loadProjectsJson();
+        if (cfg == null)
+            return false;
+        JSONArray projects = cfg.getJSONArray("projects");
+        for (int i = 0; i < projects.length(); i++) {
+            JSONObject p = projects.getJSONObject(i);
+            if (p.has("project_dir") && path.equals(p.getString("project_dir", null)))
+                return true;
+            JSONArray roots = p.has("roots") ? p.getJSONArray("roots") : new JSONArray();
+            for (int j = 0; j < roots.length(); j++)
+                if (path.equals(roots.getString(j)))
+                    return true;
+        }
+        return false;
+    }
+
+    /**
+     * Excise the routing block from each departing directory, skipping any
+     * a remaining project still claims.
+     */
+    private static void removeRoutingRules(JSONArray dirs) {
+        if (dirs == null)
+            return;
+        for (int i = 0; i < dirs.length(); i++) {
+            String dir = dirs.getString(i);
+            if (dir == null || dir.isEmpty() || dirStillConfigured(dir))
+                continue;
+            java.io.File d = new java.io.File(dir);
+            if (d.isDirectory())
+                removeClaudeMdBlock(d);
         }
     }
 
@@ -1233,6 +1283,16 @@ public class Tasks {
             }
             println(String.format("    follow-up rate: %.0f%% (how often a result was actually opened)",
                     100.0 * fetches / searches));
+            JSONArray byTool = r.getJSONArray("byTool");
+            if (byTool != null && byTool.length() > 0) {
+                println("    by tool:");
+                for (int i = 0; i < byTool.length(); i++) {
+                    JSONObject t = byTool.getJSONObject(i);
+                    println(String.format("      %-16s %5d calls  %4d zero-result  avg %dms",
+                            t.getString("tool", "?"), t.getLong("calls", 0L),
+                            t.getLong("zeroResult", 0L), t.getLong("avgLatencyMs", 0L)));
+                }
+            }
             JSONArray daily = r.getJSONArray("daily");
             if (daily != null && daily.length() > 0) {
                 println("    recent days:");
@@ -1811,6 +1871,9 @@ public class Tasks {
                     println("removed MCP entry from Claude Code (project scope) in " + root.getAbsolutePath());
             }
         }
+        // The routing block is independent of the claude CLI, so clean it up
+        // regardless; directories another project still claims keep theirs.
+        removeRoutingRules(toRemove);
     }
 
     // ----- Project-management helpers -----
@@ -2085,7 +2148,12 @@ public class Tasks {
             "\n" +
             "After you create or edit files, call `reindex_path` on them if you intend\n" +
             "to search for them in this session — the background sweep runs only every\n" +
-            "few minutes, so your own new code is otherwise invisible to `search_code`.\n";
+            "few minutes, so your own new code is otherwise invisible to `search_code`.\n" +
+            "\n" +
+            "If this session reports the code_rag MCP server as failed or disconnected,\n" +
+            "the local Code-RAG server is not running and none of the above applies.\n" +
+            "Say so to the user once at the start of the session — `code-rag start`\n" +
+            "brings it up — rather than silently falling back to Grep throughout.\n";
 
     /**
      * Create or update {@code <projectDir>/CLAUDE.local.md} so it contains the
@@ -2291,6 +2359,12 @@ public class Tasks {
             registerCodexEntry(name, url, secret);
         if (projectDir != null && !projectDir.isEmpty())
             writeClaudeMdBlock(new java.io.File(projectDir));
+        // Routing blocks for the roots themselves, so new-project/add-root
+        // take effect immediately rather than waiting for the next bld start
+        // (whose writeRoutingRules pass remains the self-repair sweep).
+        if (roots != null)
+            for (int i = 0; i < roots.length(); i++)
+                writeRoutingRule(new java.io.File(roots.getString(i)));
         if (!hasClaude && !hasCodex && (projectDir == null || projectDir.isEmpty()))
             println("Neither claude nor codex detected — skipping MCP client registration.");
     }
@@ -2304,8 +2378,9 @@ public class Tasks {
             deregisterClaudeEntry(name, claudeDirs);
         if (hasCodex)
             deregisterCodexEntry(name);
-        if (projectDir != null && !projectDir.isEmpty())
-            removeClaudeMdBlock(new java.io.File(projectDir));
+        // Excise routing blocks from the departing roots and project_dir;
+        // removeRoutingRules keeps any directory a surviving project shares.
+        removeRoutingRules(claudeDirs);
     }
 
     /** roots ++ projectDir (if set), as a fresh JSONArray for Claude registration. */

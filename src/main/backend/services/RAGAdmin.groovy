@@ -206,6 +206,27 @@ class RAGAdmin {
             }
             outjson.put("daily", daily)
 
+            // Per-tool breakdown: every tool logs now, so a flat
+            // searches/fetches summary alone would hide which parts of the
+            // tool surface earn their keep. zeroResult only counts
+            // kind='search' rows — an admin call has no result set to be
+            // empty of.
+            JSONArray byTool = new JSONArray()
+            for (Record r : db.fetchAll(
+                    ("SELECT tool, count(*) AS n, " +
+                     "       count(*) FILTER (WHERE kind='search' AND coalesce(paths,'')='') AS empt, " +
+                     "       coalesce(round(avg(latency_ms)),0) AS ms " +
+                     "  FROM ${project}.rag_query_log " +
+                     " GROUP BY tool ORDER BY n DESC, tool").toString())) {
+                JSONObject o = new JSONObject()
+                o.put("tool", r.getString("tool"))
+                o.put("calls", r.getLong("n"))
+                o.put("zeroResult", r.getLong("empt"))
+                o.put("avgLatencyMs", r.getLong("ms"))
+                byTool.put(o)
+            }
+            outjson.put("byTool", byTool)
+
             JSONArray top = new JSONArray()
             for (Record r : db.fetchAll(
                     ("SELECT query, count(*) AS n FROM ${project}.rag_query_log " +

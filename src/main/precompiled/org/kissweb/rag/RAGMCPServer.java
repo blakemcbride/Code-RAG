@@ -365,7 +365,12 @@ public class RAGMCPServer extends MCPServerBase {
                 all = RAGSearch.searchAll(conn, ProjectRegistry.listNames(), req);
             }
             final JSONArray ahits = new JSONArray();
+            final java.util.Map<String, StringBuilder> perProject = new java.util.LinkedHashMap<>();
             for (RAGSearch.Hit h : all.hits) {
+                final StringBuilder pp = perProject.computeIfAbsent(h.project, x -> new StringBuilder());
+                if (pp.length() > 0)
+                    pp.append('\n');
+                pp.append(h.repo).append('/').append(h.path);
                 final JSONObject hit = new JSONObject();
                 hit.put("project", h.project);
                 hit.put("chunk_id", h.chunkId);
@@ -394,6 +399,12 @@ public class RAGMCPServer extends MCPServerBase {
             env.put("count", ahits.length());
             addStaleWarning(env, ahits);
             env.put("hits", ahits);
+            // There is no _all schema, so the fan-out is logged into each
+            // project that contributed a hit, with that project's own subset
+            // of the paths. A query no project matched leaves no row.
+            for (java.util.Map.Entry<String, StringBuilder> e : perProject.entrySet())
+                RAGSearch.logUsage(e.getKey(), "search", "search_code", req.query,
+                        e.getValue().toString(), all.embedMillis + all.queryMillis);
             return toolResult(env.toString(2));
         }
 
@@ -521,12 +532,18 @@ public class RAGMCPServer extends MCPServerBase {
         final int k = args.getInt("k", RAGSearch.DEFAULT_K);
         final String repo = args.getString("repo", null);
 
+        final long t0 = System.currentTimeMillis();
         final JSONArray out = new JSONArray();
+        final java.util.Map<String, StringBuilder> perProject = new java.util.LinkedHashMap<>();
         int searched = 0;
         try (Connection conn = RAGSearch.openConnection()) {
             for (String proj : targetProjects()) {
                 searched++;
                 for (RAGSearch.CommitHit c : RAGSearch.searchHistory(conn, proj, query, k, repo)) {
+                    final StringBuilder pp = perProject.computeIfAbsent(proj, x -> new StringBuilder());
+                    if (pp.length() > 0)
+                        pp.append('\n');
+                    pp.append(c.repo).append('@').append(c.rev);
                     final JSONObject row = new JSONObject();
                     if (isAllProjects())
                         row.put("project", proj);
@@ -550,7 +567,26 @@ public class RAGMCPServer extends MCPServerBase {
         envelope.put("projects_searched", searched);
         envelope.put("count", out.length());
         envelope.put("commits", out);
+        logPerProject("search_history", query, perProject, System.currentTimeMillis() - t0);
         return toolResult(envelope.toString(2));
+    }
+
+    /**
+     * Log a search-shaped tool call. On a per-project endpoint one row is
+     * written (empty paths when nothing matched, so misses stay visible); on
+     * _all one row goes to each project that contributed results, since there
+     * is no _all schema — a query nothing matched leaves no row there.
+     */
+    private void logPerProject(String tool, String query,
+                               java.util.Map<String, StringBuilder> perProject, long latencyMs) {
+        if (isAllProjects()) {
+            for (java.util.Map.Entry<String, StringBuilder> e : perProject.entrySet())
+                RAGSearch.logUsage(e.getKey(), "search", tool, query, e.getValue().toString(), latencyMs);
+        } else {
+            final String proj = currentProject();
+            final StringBuilder pp = perProject.get(proj);
+            RAGSearch.logUsage(proj, "search", tool, query, pp == null ? "" : pp.toString(), latencyMs);
+        }
     }
 
     private JSONObject doFindDependents(JSONObject args) throws Exception {
@@ -564,11 +600,17 @@ public class RAGMCPServer extends MCPServerBase {
         if (limit > 200)
             limit = 200;
 
+        final long t0 = System.currentTimeMillis();
         final JSONArray rows = new JSONArray();
+        final java.util.Map<String, StringBuilder> perProject = new java.util.LinkedHashMap<>();
         int exact = 0;
         try (Connection conn = RAGSearch.openConnection()) {
             for (String proj : targetProjects()) {
                 for (RAGSearch.DepHit d : RAGSearch.findDeps(conn, proj, path.trim(), dependents, limit)) {
+                    final StringBuilder pp = perProject.computeIfAbsent(proj, x -> new StringBuilder());
+                    if (pp.length() > 0)
+                        pp.append('\n');
+                    pp.append(d.repo).append('/').append(d.path);
                     final JSONObject o = new JSONObject();
                     if (isAllProjects())
                         o.put("project", proj);
@@ -593,6 +635,9 @@ public class RAGMCPServer extends MCPServerBase {
         if (rows.length() == 0)
             env.put("note", "No import edges. Languages without tracked imports "
                     + "(markdown, sql, config) have none; otherwise run './bld deps <project>'.");
+        logPerProject("find_dependents",
+                dependents ? path.trim() : path.trim() + " (dependencies)",
+                perProject, System.currentTimeMillis() - t0);
         return toolResult(env.toString(2));
     }
 
@@ -606,13 +651,18 @@ public class RAGMCPServer extends MCPServerBase {
         if (limit > 200)
             limit = 200;
 
+        final long t0 = System.currentTimeMillis();
         final JSONArray defs = new JSONArray();
         final JSONArray refs = new JSONArray();
+        final java.util.Map<String, java.util.LinkedHashSet<String>> defPaths = new java.util.LinkedHashMap<>();
+        final java.util.Map<String, java.util.LinkedHashSet<String>> refPaths = new java.util.LinkedHashMap<>();
         int searched = 0;
         try (Connection conn = RAGSearch.openConnection()) {
             for (String proj : targetProjects()) {
                 searched++;
                 for (RAGSearch.DefHit d : RAGSearch.findDefinitions(conn, proj, symbol, limit)) {
+                    defPaths.computeIfAbsent(proj, x -> new java.util.LinkedHashSet<>())
+                            .add(d.repo + "/" + d.path);
                     final JSONObject o = new JSONObject();
                     if (isAllProjects())
                         o.put("project", proj);
@@ -630,6 +680,8 @@ public class RAGMCPServer extends MCPServerBase {
                     defs.put(o);
                 }
                 for (RAGSearch.RefHit r : RAGSearch.findReferences(conn, proj, symbol, limit)) {
+                    refPaths.computeIfAbsent(proj, x -> new java.util.LinkedHashSet<>())
+                            .add(r.repo + "/" + r.path);
                     final JSONObject o = new JSONObject();
                     if (isAllProjects())
                         o.put("project", proj);
@@ -655,6 +707,17 @@ public class RAGMCPServer extends MCPServerBase {
         env.put("references", refs);
         if (defs.length() == 0)
             env.put("note", "No definition indexed. Run './bld defs <project>' if this is unexpected.");
+        // Log definition paths; when a project has only references, log those
+        // instead so a defs-only reading doesn't misreport the call as empty.
+        final java.util.Map<String, StringBuilder> perProject = new java.util.LinkedHashMap<>();
+        final java.util.Set<String> seen = new java.util.LinkedHashSet<>(defPaths.keySet());
+        seen.addAll(refPaths.keySet());
+        for (String proj : seen) {
+            final java.util.Set<String> use =
+                    defPaths.containsKey(proj) ? defPaths.get(proj) : refPaths.get(proj);
+            perProject.put(proj, new StringBuilder(String.join("\n", use)));
+        }
+        logPerProject("find_symbol", symbol, perProject, System.currentTimeMillis() - t0);
         return toolResult(env.toString(2));
     }
 
@@ -677,12 +740,21 @@ public class RAGMCPServer extends MCPServerBase {
         params.put("project", currentProject());
         params.put("paths", paths);
 
+        final long t0 = System.currentTimeMillis();
         org.kissweb.database.Connection db = null;
         try {
             db = kissConnection();
             final JSONObject res = (JSONObject) org.kissweb.restServer.GroovyService.run(
                     "scripts", "RAGIndexer", "reindexPathsJson", null, db, params);
             db.commit();
+            final StringBuilder pb = new StringBuilder();
+            for (int i = 0; i < paths.length(); i++) {
+                if (pb.length() > 0)
+                    pb.append('\n');
+                pb.append(paths.getString(i));
+            }
+            RAGSearch.logUsage(currentProject(), "admin", "reindex_path", null,
+                    pb.toString(), System.currentTimeMillis() - t0);
             return toolResult(res.toString(2));
         } catch (Exception e) {
             if (db != null) {
@@ -759,6 +831,10 @@ public class RAGMCPServer extends MCPServerBase {
             for (String proj : targetProjects())
                 appendRepos(conn, proj, out);
         }
+        // Logged on the per-project endpoint only — fanning an _all browse
+        // call into every schema would be noise, not signal.
+        if (!isAllProjects())
+            RAGSearch.logUsage(currentProject(), "admin", "list_repos", null, "", 0L);
         return toolResult(out.toString(2));
     }
 
@@ -797,7 +873,9 @@ public class RAGMCPServer extends MCPServerBase {
             envelope.put("projects", rows);
             return toolResult(envelope.toString(2));
         }
-        return toolResult(projectStatus(currentProject()).toString(2));
+        final JSONObject status = projectStatus(currentProject());
+        RAGSearch.logUsage(currentProject(), "admin", "index_status", null, "", 0L);
+        return toolResult(status.toString(2));
     }
 
     private JSONObject projectStatus(String proj) throws Exception {

@@ -1859,6 +1859,12 @@ public final class RAGSearch {
      * <br><br>
      * Best-effort and non-fatal: a logging failure must never break a search.
      * Disabled with {@code RAGLogQueries=false}.
+     * <br><br>
+     * Kinds: {@code search} for query-shaped calls (search_code,
+     * search_history, find_symbol, find_dependents — paths hold what came
+     * back, empty on a miss), {@code fetch} for get_chunk, and {@code admin}
+     * for reindex_path / list_repos / index_status. Eval mining
+     * (eval/mine.py) reads only search_code and get_chunk rows.
      */
     public static void logUsage(String project, String kind, String tool,
                                 String query, String paths, long latencyMs) {

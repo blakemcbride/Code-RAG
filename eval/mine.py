@@ -48,8 +48,12 @@ def main():
     # paths holds newline-separated values, and psql emits rows line by line —
     # so newlines must be swapped for a sentinel or every multi-path row is
     # parsed as several broken rows.
+    # Filter by tool, not just kind: every tool logs now, and only a
+    # search_code -> get_chunk pair is a relevance judgement. A find_symbol
+    # or search_history row must neither mine as a query nor count as the
+    # follow-up fetch that validates one.
     rows = psql(f"""
-        SELECT log_id, extract(epoch from at)::bigint, kind,
+        SELECT log_id, extract(epoch from at)::bigint, kind, coalesce(tool,''),
                replace(coalesce(query,''), chr(10), ' '),
                replace(coalesce(paths,''), chr(10), '|')
           FROM {project}.rag_query_log
@@ -57,11 +61,14 @@ def main():
     """)
     searches, fetches = [], []
     for row in rows:
-        if len(row) < 5:
+        if len(row) < 6:
             continue
-        log_id, ts, kind, query, paths = row[:5]
+        log_id, ts, kind, tool, query, paths = row[:6]
         rec = (int(ts), query, [p for p in paths.split("|") if p])
-        (searches if kind == "search" else fetches).append(rec)
+        if kind == "search" and tool == "search_code":
+            searches.append(rec)
+        elif kind == "fetch" and tool == "get_chunk":
+            fetches.append(rec)
 
     if not searches:
         print(f"No searches logged for '{project}' yet. Use the tool, then re-run.")
