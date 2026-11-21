@@ -44,6 +44,17 @@ class RAGDefs {
      */
     private static final List<String> LANGMAPS = ["Java:+.groovy"]
 
+    /**
+     * Longest tag name stored. No real identifier approaches this, but ctags
+     * will emit a "name" of many kilobytes from data-like files, and one of
+     * those overflows the btree index on name_lower ("index row requires
+     * 12832 bytes, maximum size is 8191"). The failed INSERT aborted the
+     * whole root: stack360's Backend root — the largest — had no definitions
+     * at all, on every sweep, and find_symbol silently missed everything in
+     * it. Skipping the row costs nothing; it could never match a lookup.
+     */
+    private static final int MAX_NAME_LEN = 256
+
     /** Directories never worth parsing; mirrors the indexer's base excludes. */
     private static final List<String> EXCLUDES = [
             ".git", "node_modules", "target", "build", "work", "dist", "out",
@@ -167,7 +178,7 @@ class RAGDefs {
                             continue
                         String name = t.getString("name", null)
                         int lineNo = t.getInt("line", 0)
-                        if (name == null || name.isEmpty() || lineNo <= 0)
+                        if (name == null || name.isEmpty() || lineNo <= 0 || name.length() > MAX_NAME_LEN)
                             continue
                         db.execute(
                                 ("INSERT INTO ${project}.rag_def " +
@@ -228,7 +239,7 @@ class RAGDefs {
                         continue
                     String name = t.getString("name", null)
                     int lineNo = t.getInt("line", 0)
-                    if (name == null || name.isEmpty() || lineNo <= 0)
+                    if (name == null || name.isEmpty() || lineNo <= 0 || name.length() > MAX_NAME_LEN)
                         continue
                     db.execute(
                             ("INSERT INTO ${project}.rag_def " +

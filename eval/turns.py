@@ -163,7 +163,9 @@ def rag_rank(query, url, token, k):
         data=json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
                          "params": {"name": "search_code",
                                     "arguments": {"query": query, "k": k}}}).encode(),
-        headers={"Content-Type": "application/json", "X-RAG-Token": token})
+        # X-RAG-Source: eval keeps this run out of the usage/adoption figures.
+        headers={"Content-Type": "application/json", "X-RAG-Token": token,
+                 "X-RAG-Source": "eval"})
     with urllib.request.urlopen(req, timeout=120) as r:
         env = json.loads(json.load(r)["result"]["content"][0]["text"])
     return [h["path"] for h in env["hits"]]

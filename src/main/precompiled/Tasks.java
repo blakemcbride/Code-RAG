@@ -249,13 +249,20 @@ public class Tasks {
         println("                                          routing snippet at <dir> so a Claude Code session");
         println("                                          launched from there (an umbrella directory above");
         println("                                          the roots) sees the MCP tool");
-        println("remove-project <name>                     drop a project + deregister MCP entries");
+        println("remove-project <name> [<name>...]         drop project(s) + deregister MCP entries");
         println("add-root <name> <root> [<root>...]        add roots to an existing project");
         println("remove-root <name> <root> [<root>...]     remove roots from an existing project");
         println("history <project|all>                     index git/svn commit history (search_history)");
         println("defs <project|all>                        extract ctags symbol definitions (find_symbol)");
         println("deps <project|all>                        backfill the import graph (find_dependents)");
-        println("usage <project|all>                       is the tool actually being called? (from rag_query_log)");
+        println("search \"<what the code does>\"             semantic code search from the shell (project = cwd)");
+        println("why \"<why/when did X change>\"             search commit history");
+        println("symbol <Name>                             where a symbol is defined, called and tested");
+        println("dependents <file> [--deps]                which files import a file (or what it imports)");
+        println("                                          all four: -k N, --project NAME, --all, --json");
+        println("usage <project|all>                       calls the server received (from rag_query_log)");
+        println("adoption [days]                           index searches vs grep, and whether results were");
+        println("                                          opened (from Claude Code session transcripts)");
         println("routing-rules                             rewrite the CLAUDE.local.md routing blocks now");
         println("                                          (otherwise they refresh only on 'bld start')");
         println("summarize <project|all> [--regenerate]    generate per-file LLM summaries (slow, GPU-bound)");
@@ -1077,11 +1084,30 @@ public class Tasks {
         return m.find() ? Integer.parseInt(m.group(1)) : 0;
     }
 
-    /** Extract a string field value out of a JSON-RPC response by key name. Returns null if absent. */
+    /**
+     * Extract a string field value out of a JSON-RPC response by key name.
+     * Returns null if absent. The value is returned still JSON-escaped.
+     *
+     * The value is scanned by hand rather than matched with a
+     * {@code (?:\\"|[^"])*} group: java.util.regex recurses once per
+     * repetition of an alternation, so a value of a few kilobytes — a
+     * reconcile plan listing a few dozen projects — overflowed the stack and
+     * surfaced only as "error executing task scan".
+     */
     private static String extractJsonString(String json, String key) {
         java.util.regex.Matcher m = java.util.regex.Pattern.compile(
-                "\"" + java.util.regex.Pattern.quote(key) + "\"\\s*:\\s*\"((?:\\\\\"|[^\"])*)\"").matcher(json);
-        return m.find() ? m.group(1) : null;
+                "\"" + java.util.regex.Pattern.quote(key) + "\"\\s*:\\s*\"").matcher(json);
+        if (!m.find())
+            return null;
+        int start = m.end();
+        for (int i = start; i < json.length(); i++) {
+            char c = json.charAt(i);
+            if (c == '\\')
+                i++;
+            else if (c == '"')
+                return json.substring(start, i);
+        }
+        return null;
     }
 
     /** Issue a JSON POST with the default 15s read timeout. */
@@ -1293,10 +1319,9 @@ public class Tasks {
                 continue;
             }
             long searches = r.getLong("searches", 0L);
-            long fetches = r.getLong("fetches", 0L);
             println("");
             println("  " + p);
-            println("    searches: " + searches + "   follow-up fetches: " + fetches
+            println("    searches: " + searches
                     + "   zero-result: " + r.getLong("zeroResultSearches", 0L)
                     + "   avg " + r.getLong("avgLatencyMs", 0L) + "ms");
             if (searches == 0) {
@@ -1304,8 +1329,23 @@ public class Tasks {
                 println("    check the routing block in <root>/CLAUDE.local.md and the MCP registration.");
                 continue;
             }
-            println(String.format("    follow-up rate: %.0f%% (how often a result was actually opened)",
-                    100.0 * fetches / searches));
+            // No "follow-up rate" here. It used to be get_chunk calls per
+            // search, but file-granularity results are opened with the
+            // client's own Read, which the server never sees — so it read 0%
+            // however useful the results were. 'code-rag adoption' measures
+            // that from the client's transcripts instead.
+            JSONArray bySource = r.getJSONArray("bySource");
+            if (bySource != null && bySource.length() > 0) {
+                StringBuilder sb = new StringBuilder("    by caller:");
+                for (int i = 0; i < bySource.length(); i++) {
+                    JSONObject o = bySource.getJSONObject(i);
+                    String src = o.getString("source", "?");
+                    sb.append("  ").append(src).append(' ').append(o.getLong("searches", 0L));
+                    if ("eval".equals(src))
+                        sb.append(" (benchmark runs, excluded from the figures here)");
+                }
+                println(sb.toString());
+            }
             JSONArray byTool = r.getJSONArray("byTool");
             if (byTool != null && byTool.length() > 0) {
                 println("    by tool:");
@@ -1321,8 +1361,8 @@ public class Tasks {
                 println("    recent days:");
                 for (int i = 0; i < Math.min(7, daily.length()); i++) {
                     JSONObject d = daily.getJSONObject(i);
-                    println(String.format("      %s  %4d searches  %4d fetches",
-                            d.getString("date", "?"), d.getLong("searches", 0L), d.getLong("fetches", 0L)));
+                    println(String.format("      %s  %4d searches",
+                            d.getString("date", "?"), d.getLong("searches", 0L)));
                 }
             }
             JSONArray top = r.getJSONArray("topQueries");
@@ -1730,49 +1770,61 @@ public class Tasks {
      * drops the schema without re-prompting.
      */
     public static void removeProject() {
-        if (commandArgs.length != 1) {
-            System.err.println("Usage: ./bld remove-project <name>");
+        if (commandArgs.length < 1) {
+            System.err.println("Usage: ./bld remove-project <name> [<name>...]");
             System.exit(1);
         }
-        String name = canonicalizeProjectName(commandArgs[0]);
-        if (!requireValidProjectName(name))
-            System.exit(1);
         JSONObject cfg = loadProjectsJson();
         if (cfg == null)
             System.exit(1);
-        if (findProject(cfg, name) == null) {
-            System.err.println("Project '" + name + "' is not in rag-projects.json.");
-            System.exit(1);
+        // Validate every name before mutating anything, so a typo in the
+        // tenth name cannot leave the first nine half-removed.
+        java.util.LinkedHashSet<String> names = new java.util.LinkedHashSet<>();
+        for (String raw : commandArgs) {
+            String name = canonicalizeProjectName(raw);
+            if (!requireValidProjectName(name))
+                System.exit(1);
+            if (findProject(cfg, name) == null) {
+                System.err.println("Project '" + name + "' is not in rag-projects.json.");
+                System.exit(1);
+            }
+            names.add(name);
         }
         JSONArray projects = cfg.getJSONArray("projects");
-        if (projects.length() == 1) {
-            System.err.println("Cannot remove '" + name + "': it is the only configured project.");
-            System.err.println("Add another project first, or drop the schema manually with:");
-            System.err.println("    psql -d code_rag -c 'DROP SCHEMA " + name + " CASCADE'");
+        if (projects.length() <= names.size()) {
+            System.err.println("Cannot remove " + names + ": at least one project must remain configured.");
+            System.err.println("Add another project first, or drop a schema manually with:");
+            System.err.println("    psql -d code_rag -c 'DROP SCHEMA <name> CASCADE'");
             System.exit(1);
         }
         // Capture roots + project_dir before mutating cfg — we need them to
         // know which .mcp.json files (and which CLAUDE.local.md block) to clean up
-        // after the project is gone from the JSON.
-        JSONObject existingProj = findProject(cfg, name);
-        JSONArray departingRoots = existingProj.getJSONArray("roots");
-        String departingProjectDir = existingProj.has("project_dir")
-                ? existingProj.getString("project_dir", null) : null;
+        // after the projects are gone from the JSON.
+        java.util.List<JSONObject> departing = new java.util.ArrayList<>();
         JSONArray remaining = new JSONArray();
         for (int i = 0; i < projects.length(); i++) {
             JSONObject p = projects.getJSONObject(i);
-            if (!name.equals(p.getString("name")))
+            if (names.contains(p.getString("name")))
+                departing.add(p);
+            else
                 remaining.put(p);
         }
         cfg.put("projects", remaining);
         if (!saveProjectsJson(cfg))
             System.exit(1);
         syncProjectsRuntimeCopies();
-        deregisterMcpEntries(name, departingRoots, departingProjectDir);
-        // bld -y scan all so reconcile drops the schema without prompting
-        // (the user already committed by typing remove-project).
+        for (JSONObject p : departing)
+            deregisterMcpEntries(p.getString("name"), p.getJSONArray("roots"),
+                    p.has("project_dir") ? p.getString("project_dir", null) : null);
+        // One 'bld -y scan all' for the whole batch, so reconcile drops the
+        // schemas without prompting (the user already committed by typing
+        // remove-project). Several names in one call cost one sweep, not one
+        // sweep each.
         assumeYes = true;
         scanTarget = "all";
+        // scan() re-parses commandArgs for its own target; left in place it
+        // would take the first just-removed project name as the thing to scan.
+        commandArgs = new String[0];
         scan();
     }
 
@@ -2145,44 +2197,69 @@ public class Tasks {
             "<!-- BEGIN code-rag managed block — do not edit between markers; bld rewrites it -->";
     private static final String CLAUDE_MD_BLOCK_END =
             "<!-- END code-rag managed block -->";
-    private static final String CLAUDE_MD_BLOCK_BODY =
-            "This repository is indexed by Code-RAG, a local MCP server. Choose your\n" +
-            "search tool by WHAT YOU KNOW, not by habit:\n" +
+    /**
+     * The routing block's text.
+     *
+     * Built around the SHELL commands ({@code code-rag search|why|symbol|
+     * dependents}), not the MCP tools. The previous block named the MCP tools
+     * and told the agent to choose between them and "Grep / Glob" — but the
+     * transcripts showed agents search through the shell (tens of thousands
+     * of grep/rg/find commands, no Grep-tool calls at all), that the MCP
+     * schemas are deferred behind a lookup step, and that delegated searches
+     * run in subagents. A command that sits next to grep in the same shell
+     * has none of those three problems. The MCP tools stay registered and are
+     * mentioned as the equivalent route.
+     *
+     * {@code cmd} is how to invoke the wrapper: the bare name when it is on
+     * PATH, otherwise the absolute path inside this installation.
+     */
+    private static String routingBlockBody() {
+        String cmd = isOnPath("code-rag") ? "code-rag"
+                : new java.io.File("code-rag").getAbsolutePath();
+        return
+            "This repository is indexed by Code-RAG, a local code index you query from\n" +
+            "the shell, exactly like grep. Before you search, ask one question: can you\n" +
+            "NAME what you are looking for?\n" +
             "\n" +
-            "- You know the exact token (symbol, string, file name, import) →\n" +
-            "  **Grep / Glob**. Nothing beats it when you can name the thing.\n" +
-            "- You know the CONCEPT but not the token (\"where do we enforce the\n" +
-            "  session timeout\", \"what calculates benefit cost\", \"how is X wired\n" +
-            "  up\") → **`search_code`**. Guessing keywords for Grep is the failure\n" +
-            "  mode it exists to remove.\n" +
-            "- You want to know WHY something is the way it is, when it changed, or\n" +
-            "  what moved with it → **`search_history`** (indexed git and Subversion\n" +
-            "  commit messages). No amount of reading the tree answers this.\n" +
-            "- You know the exact symbol and want where it is DEFINED, what CALLS it,\n" +
-            "  or what tests cover it → **`find_symbol`** (ctags definitions plus\n" +
-            "  classified references: caller/test/doc). Before editing a file, use\n" +
-            "  **`find_dependents`** to see which files import it — what breaks if you\n" +
-            "  change it. Both beat Grep: they classify and rank instead of dumping\n" +
-            "  every textual match.\n" +
+            "- You know the exact token (symbol, string, file name) → `grep` / `rg`.\n" +
+            "  Nothing beats it when you can name the thing.\n" +
+            "- You know what the code DOES but not what it is called (\"where is the\n" +
+            "  session timeout enforced\", \"what calculates benefit cost\") →\n" +
+            "  `" + cmd + " search \"<describe it in plain words>\"`\n" +
+            "  Guessing keywords for grep is the failure mode this removes: on a large\n" +
+            "  tree an ordinary word matches hundreds of files.\n" +
+            "- You want to know WHY code is the way it is, or when it changed →\n" +
+            "  `" + cmd + " why \"<the question>\"` (indexed git and Subversion commit\n" +
+            "  messages). Reading the tree cannot answer this.\n" +
+            "- You have a symbol and want where it is DEFINED, what CALLS it and what\n" +
+            "  TESTS it → `" + cmd + " symbol <Name>` (classified and ranked, not every\n" +
+            "  textual match).\n" +
+            "- You are ABOUT TO EDIT a file other code may depend on →\n" +
+            "  `" + cmd + " dependents <path/to/File>` first: it lists the files that\n" +
+            "  import it, i.e. what your change can break.\n" +
             "\n" +
-            "`search_code` returns ranked FILES by default, each with the symbols that\n" +
-            "matched and an excerpt already widened to the whole enclosing function, so\n" +
-            "one call is usually enough — Read the returned path and line range only\n" +
-            "when you need more context around it. It covers every repository in this\n" +
-            "project at once, which a directory-scoped Grep cannot.\n" +
+            "Rule of thumb: if a grep came back with more than ~20 files, or with\n" +
+            "nothing, do not refine the pattern — run `" + cmd + " search` instead.\n" +
             "\n" +
-            "If the answer might live in a DIFFERENT repository, use the `code_rag_all`\n" +
-            "server, which searches every indexed project and tags each hit with the\n" +
-            "project it came from.\n" +
+            "Each result is a `path:start-end` line plus a short excerpt; Read that\n" +
+            "range if you need more. The commands work from any directory inside this\n" +
+            "repository and cover every repository of the project at once. Add `--all`\n" +
+            "to search every indexed project on this machine, `-k N` for more results,\n" +
+            "`-n 0` for paths only.\n" +
             "\n" +
-            "After you create or edit files, call `reindex_path` on them if you intend\n" +
-            "to search for them in this session — the background sweep runs only every\n" +
-            "few minutes, so your own new code is otherwise invisible to `search_code`.\n" +
+            "When you delegate a search to a subagent, put the relevant command in its\n" +
+            "prompt — it works there too.\n" +
             "\n" +
-            "If this session reports the code_rag MCP server as failed or disconnected,\n" +
-            "the local Code-RAG server is not running and none of the above applies.\n" +
-            "Say so to the user once at the start of the session — `code-rag start`\n" +
-            "brings it up — rather than silently falling back to Grep throughout.\n";
+            "The same four queries are also MCP tools (`search_code`, `search_history`,\n" +
+            "`find_symbol`, `find_dependents`); use whichever is at hand. After creating\n" +
+            "or editing files you intend to search for in this session, call the MCP\n" +
+            "tool `reindex_path` on them — the background sweep runs only every few\n" +
+            "minutes.\n" +
+            "\n" +
+            "If a command reports that the Code-RAG server is not running, say so to the\n" +
+            "user once (`code-rag start` brings it up) and use grep meanwhile, rather\n" +
+            "than silently doing without it.\n";
+    }
 
     /**
      * Create or update {@code <projectDir>/CLAUDE.local.md} so it contains the
@@ -2221,7 +2298,7 @@ public class Tasks {
         } else {
             existing = "";
         }
-        String managed = CLAUDE_MD_BLOCK_BEGIN + "\n" + CLAUDE_MD_BLOCK_BODY + CLAUDE_MD_BLOCK_END + "\n";
+        String managed = CLAUDE_MD_BLOCK_BEGIN + "\n" + routingBlockBody() + CLAUDE_MD_BLOCK_END + "\n";
         int beginIdx = existing.indexOf(CLAUDE_MD_BLOCK_BEGIN);
         int endIdx = existing.indexOf(CLAUDE_MD_BLOCK_END);
         String updated;

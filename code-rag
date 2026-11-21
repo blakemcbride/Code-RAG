@@ -23,4 +23,16 @@ if [[ "${1:-}" == "monitor" ]]; then
     exec watch -n 1 'echo; nvidia-smi; ollama ps'
 fi
 
+# Query subcommands — the index from the shell, where an agent already works.
+# Deliberately NOT bld tasks: bld compiles and starts a JVM, and a search has
+# to be as cheap to reach for as grep or it will not be reached for. These run
+# from the caller's cwd on purpose (the cwd selects the project).
+case "${1:-}" in
+    search|why|symbol|dependents)
+        exec python3 "$CODE_RAG_HOME/cli/query.py" "$@" ;;
+    adoption)
+        shift
+        exec python3 "$CODE_RAG_HOME/cli/adoption.py" "$@" ;;
+esac
+
 cd "$CODE_RAG_HOME" && exec ./bld "$@"

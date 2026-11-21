@@ -1,0 +1,10 @@
+{"id": "invoice", "kind": "conceptual", "task": "Where do we generate an invoice from timesheets?", "expect": ["BInvoice", "CreateTimesheetInvoice"]}
+{"id": "screens", "kind": "conceptual", "task": "What controls which screens a user is allowed to see?", "expect": ["BScreenGroup", "ScreenGroup"]}
+{"id": "accrual", "kind": "conceptual", "task": "Where is the amount of time off an employee accrues calculated?", "expect": ["TimeOffAccrual"]}
+{"id": "receipt", "kind": "conceptual", "task": "Where do we record a payment received from a customer?", "expect": ["BReceipt", "ReceivePayment", "SaveDeposit"]}
+{"id": "reports-to", "kind": "conceptual", "task": "How does the system keep track of who reports to whom inside a company?", "expect": ["BOrgGroup", "ReportingLines", "OrgGroupHierarchy"]}
+{"id": "reconcile", "kind": "conceptual", "task": "In bank reconciliation, which backend service marks transactions as cleared?", "expect": ["SetLinesCleared"]}
+{"id": "prospect", "kind": "conceptual", "task": "Where is a business we hope to sell to, but have not signed yet, modeled?", "expect": ["BProspectCompany", "ProspectCompany"]}
+{"id": "enroll-approve", "kind": "conceptual", "task": "Which backend service approves or rejects an employee's benefit enrollment?", "expect": ["ApproveEnrollment", "RejectEnrollment"]}
+{"id": "sym-payroll", "kind": "symbol", "task": "Where is LoadPayrollReturn defined, and which service uses it?", "expect": ["LoadPayrollReturn"]}
+{"id": "sym-changelog", "kind": "symbol", "task": "Where is BChangeLog defined?", "expect": ["BChangeLog"]}

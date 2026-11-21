@@ -250,6 +250,53 @@ and demonstrably better on this corpus still reaches for grep 442 times out of
 443. That is a tool-selection question, not a retrieval question, and no amount
 of index tuning will answer it.
 
+## November review: adoption fixed in a test, benefit not shown
+
+**Usage after three months.** About 15 real searches across 68 projects in six
+weeks, against roughly 40,000 shell searches in the same transcripts
+(`code-rag adoption`). 122 of the 209 rows in the log were one `turns.py` run.
+
+**Causes found, and what changed.** (1) Agents search through Bash; the Grep
+*tool* the routing block named is never called. (2) The MCP schemas were
+deferred behind a ToolSearch step. (3) Delegated searches run in subagents.
+Response: `code-rag search|why|symbol|dependents` as shell commands, the
+routing block rewritten around them, the four query tools marked
+always-load, harness traffic tagged `source='eval'`, the meaningless
+server-side follow-up rate removed, and the index pruned from 68 projects to
+21.
+
+**A bug that had been hiding the structural index.** stack360's Backend root
+had zero ctags definitions: one multi-kilobyte tag name overflowed the btree
+index and aborted the root on every sweep. Fixed; stack360 went from 130,525
+to 317,307 definitions.
+
+**Live A/B (`eval/ab.py`, stack360, 9 tasks, one run each, Fable 5.2).**
+
+| | with index | without |
+|---|---|---|
+| used the index | 8/9 | — |
+| correct | 9/9 | 9/9 |
+| mean tool calls | 4.7 | 5.0 |
+| mean tokens | 167,846 | 143,226 |
+| mean cost | $0.554 | $0.535 |
+| mean seconds | 11 | 11 |
+
+(One `with` answer was auto-scored wrong for writing "screen group" rather
+than `ScreenGroup`; read by hand it is correct.)
+
+Two findings. The adoption problem is solvable: with the new block the agent
+reached for the index in 8 of 9 runs. But **the index did not make the agent
+faster, cheaper or more accurate** on these tasks. The 86%-vs-0% result from
+`turns.py` did not survive contact with a real agent, which greps far better
+than the simulated one and has the project's own `AI/kb` notes to start from.
+The agent also kept grepping after the index call (to verify), so the index
+call was added work as often as it was saved work.
+
+Caveats: n=9, one run per arm, single-file "where is X" tasks only — no
+multi-file tracing, no history questions, no edit tasks where `dependents`
+would matter. It is evidence of no large effect on lookup tasks, not proof of
+none anywhere.
+
 ---
 
 ## STATUS: Phases 0–4 complete (measured on the `kiss` corpus)

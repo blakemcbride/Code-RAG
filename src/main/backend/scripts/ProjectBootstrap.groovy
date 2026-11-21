@@ -38,11 +38,12 @@ class ProjectBootstrap {
      *   v6 — rag_query_log (real usage, for mining an honest eval set)
      *   v7 — rag_def (ctags symbol definitions: the code-graph index)
      *   v8 — rag_dep (import graph: which file depends on which)
+     *   v9 — rag_query_log.source (mcp / cli / eval: keeps harness runs out of usage)
      *
-     * v4-v8 require no rebuild: every addition is populated by its own pass
+     * v4-v9 require no rebuild: every addition is populated by its own pass
      * (./bld history, ./bld summarize, live usage) and none invalidates chunks.
      */
-    static final int CURRENT_SCHEMA_VERSION = 8
+    static final int CURRENT_SCHEMA_VERSION = 9
 
     /**
      * Ensure each configured project's schema + tables exist and are migrated
@@ -231,6 +232,9 @@ class ProjectBootstrap {
             case 8:
                 addDepTable(db, project)
                 break
+            case 9:
+                addQueryLogSource(db, project)
+                break
             default:
                 throw new RuntimeException("No migration defined for schema version ${toVersion}")
         }
@@ -382,6 +386,18 @@ class ProjectBootstrap {
         """.toString())
         db.execute(("CREATE INDEX IF NOT EXISTS rag_query_log_at ON " +
                     project + ".rag_query_log(at)").toString())
+        addQueryLogSource(db, project)
+    }
+
+    /**
+     * Who made the call: 'mcp' (an agent via the MCP tools), 'cli' (the
+     * code-rag shell subcommands) or 'eval' (a benchmark harness). Without it
+     * a single harness run is indistinguishable from organic use and inflates
+     * every adoption number. Existing rows default to 'mcp'.
+     */
+    private static void addQueryLogSource(Connection db, String project) {
+        db.execute(("ALTER TABLE ${project}.rag_query_log " +
+                    "ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'mcp'").toString())
     }
 
     /**

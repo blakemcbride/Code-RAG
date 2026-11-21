@@ -193,3 +193,5 @@ eval/stack360-queries.jsonl
 # Code-RAG local index files (written by bld; machine-local, not part of the project)
 .mcp.json
 CLAUDE.local.md
+src/main/backend/rag-projects.json.before-*
+cli/__pycache__/

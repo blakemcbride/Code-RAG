@@ -183,7 +183,7 @@ class RAGAdmin {
                      "       count(*) FILTER (WHERE kind='fetch')  AS fetches, " +
                      "       count(*) FILTER (WHERE kind='search' AND coalesce(paths,'')='') AS empties, " +
                      "       coalesce(round(avg(latency_ms) FILTER (WHERE kind='search')),0) AS avg_ms " +
-                     "  FROM ${project}.rag_query_log").toString())
+                     "  FROM ${project}.rag_query_log WHERE source <> 'eval'").toString())
             outjson.put("project", project)
             outjson.put("searches", tot.getLong("searches"))
             outjson.put("fetches", tot.getLong("fetches"))
@@ -196,7 +196,7 @@ class RAGAdmin {
                      "       count(*) FILTER (WHERE kind='search') AS s, " +
                      "       count(*) FILTER (WHERE kind='fetch') AS f " +
                      "  FROM ${project}.rag_query_log " +
-                     " WHERE at > now() - interval '${days} days' " +
+                     " WHERE at > now() - interval '${days} days' AND source <> 'eval' " +
                      " GROUP BY 1 ORDER BY 1 DESC").toString())) {
                 JSONObject o = new JSONObject()
                 o.put("date", r.getString("d"))
@@ -216,7 +216,7 @@ class RAGAdmin {
                     ("SELECT tool, count(*) AS n, " +
                      "       count(*) FILTER (WHERE kind='search' AND coalesce(paths,'')='') AS empt, " +
                      "       coalesce(round(avg(latency_ms)),0) AS ms " +
-                     "  FROM ${project}.rag_query_log " +
+                     "  FROM ${project}.rag_query_log WHERE source <> 'eval' " +
                      " GROUP BY tool ORDER BY n DESC, tool").toString())) {
                 JSONObject o = new JSONObject()
                 o.put("tool", r.getString("tool"))
@@ -230,7 +230,7 @@ class RAGAdmin {
             JSONArray top = new JSONArray()
             for (Record r : db.fetchAll(
                     ("SELECT query, count(*) AS n FROM ${project}.rag_query_log " +
-                     " WHERE kind='search' AND query IS NOT NULL " +
+                     " WHERE kind='search' AND query IS NOT NULL AND source <> 'eval' " +
                      " GROUP BY query ORDER BY n DESC, query LIMIT 10").toString())) {
                 JSONObject o = new JSONObject()
                 o.put("query", r.getString("query"))
@@ -238,6 +238,24 @@ class RAGAdmin {
                 top.put(o)
             }
             outjson.put("topQueries", top)
+
+            // How the calls arrived. 'eval' rows are benchmark-harness
+            // traffic: reported here so they are visible, but excluded from
+            // every other figure above — they say nothing about adoption.
+            JSONArray bySource = new JSONArray()
+            for (Record r : db.fetchAll(
+                    ("SELECT source, count(*) AS n, " +
+                     "       count(*) FILTER (WHERE at > now() - interval '${days} days') AS recent " +
+                     "  FROM ${project}.rag_query_log WHERE kind='search' " +
+                     " GROUP BY source ORDER BY source").toString())) {
+                JSONObject o = new JSONObject()
+                o.put("source", r.getString("source"))
+                o.put("searches", r.getLong("n"))
+                o.put("recent", r.getLong("recent"))
+                bySource.put(o)
+            }
+            outjson.put("bySource", bySource)
+            outjson.put("days", days)
         } catch (Exception e) {
             logger.error("RAGAdmin.usage[${project}] failed", e)
             outjson.put("error", e.message ?: e.toString())

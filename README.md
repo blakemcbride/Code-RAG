@@ -106,7 +106,7 @@ Optional passes add capability once indexing works:
 ./bld deps all       # import graph         -> find_dependents   (seconds)
 ./bld history all    # commit messages      -> search_history    (minutes)
 ./bld summarize all  # per-file LLM summary -> better search_code (hours, GPU)
-./bld usage all      # is any of this actually being called?
+code-rag adoption    # is any of this actually being used? (index searches vs grep)
 ```
 
 For the same procedure broken into named, verified steps (with expected

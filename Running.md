@@ -302,18 +302,51 @@ only the files that changed.
 Add `--symbols` to `summarize` for per-symbol summaries of large files
 (slower again; worth it only where single files run to hundreds of chunks).
 
+### Searching from the shell
+
+The four query tools are also plain commands, usable from any directory
+inside an indexed project (the directory selects the project):
+
+```bash
+code-rag search "where is the session timeout enforced"   # semantic code search
+code-rag why "why did the invoice rounding change"        # commit history
+code-rag symbol BInvoice                                  # defined / called from / tests
+code-rag dependents src/java/com/x/Foo.java               # who imports it (--deps: what it imports)
+```
+
+Options: `-k N` results, `-n N` excerpt lines (`-n 0` = paths only),
+`--project NAME`, `--all` (every indexed project), `--json` (raw envelope);
+`search` also takes `--lang`, `--path`, `--repo`. Output is
+`path:start-end` lines with a short excerpt. Exit status 3 means the server
+is not running.
+
+These exist because agents search through the shell. The routing block in
+each root's `CLAUDE.local.md` points Claude Code at these commands; the MCP
+tools remain available and return the same results.
+
 ### Is it actually being used?
 
 ```bash
-./bld usage all
+code-rag adoption 30     # index searches vs grep, per project, from Claude Code's transcripts
+./bld usage all          # what the server received, by tool and by caller
 ```
 
-Reads the query log and reports searches per day, how often a result was
-actually opened, zero-result queries, a per-tool breakdown (every MCP
-tool logs, not just `search_code`), and your most frequent searches.
-Retrieval scores say the tool *can* find things; this says whether Claude
-Code is asking it to. If searches stay at zero, fix the routing block in
-`<root>/CLAUDE.local.md` before tuning anything.
+`adoption` is the one to trust: it is the only measure with a denominator.
+For each indexed project it counts index searches (MCP tools and the shell
+commands) against every other search the agent ran (`grep`/`rg`/`find`,
+Grep/Glob), and how many index results were then opened. A share near zero
+means the agent is not reaching for the index — fix that before tuning
+retrieval.
+
+`usage` reads the server's query log: searches per day, zero-result
+queries, a per-tool breakdown and a per-caller breakdown (`mcp`, `cli`,
+`eval`). Benchmark-harness calls (`eval`) are listed but excluded from the
+other figures.
+
+For a direct measurement, `python3 eval/ab.py eval/<project>-ab-tasks.jsonl
+<project>` gives each task to a headless Claude Code session twice — with
+and without the index — and reports real tool calls, tokens and
+correctness. It spends model tokens (two agent sessions per task).
 
 ### Measure retrieval quality
 

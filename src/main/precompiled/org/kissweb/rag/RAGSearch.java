@@ -1866,6 +1866,32 @@ public final class RAGSearch {
      * for reindex_path / list_repos / index_status. Eval mining
      * (eval/mine.py) reads only search_code and get_chunk rows.
      */
+    /**
+     * Who is asking, for this request: {@code mcp} (an agent through the MCP
+     * tool surface — the default), {@code cli} (the {@code code-rag search}
+     * family of shell subcommands) or {@code eval} (a benchmark harness).
+     * Recorded on every usage row so harness traffic can be kept out of the
+     * adoption numbers: one benchmark run once accounted for 122 of 209
+     * logged calls and read as organic use.
+     */
+    private static final ThreadLocal<String> CURRENT_SOURCE = new ThreadLocal<>();
+
+    /**
+     * Set the caller kind for the current request thread. Anything other
+     * than {@code cli} or {@code eval} is recorded as {@code mcp}. Must be
+     * called on every request (even with null) so a pooled thread cannot
+     * carry a previous request's value.
+     */
+    public static void setSource(String source) {
+        String s = source == null ? "" : source.trim().toLowerCase();
+        CURRENT_SOURCE.set("cli".equals(s) || "eval".equals(s) ? s : "mcp");
+    }
+
+    private static String currentSource() {
+        String s = CURRENT_SOURCE.get();
+        return s == null ? "mcp" : s;
+    }
+
     public static void logUsage(String project, String kind, String tool,
                                 String query, String paths, long latencyMs) {
         if (project == null || !ProjectRegistry.isValidName(project))
@@ -1874,13 +1900,14 @@ public final class RAGSearch {
             return;
         try (Connection conn = openConnection();
              PreparedStatement ps = conn.prepareStatement(
-                     "INSERT INTO " + project + ".rag_query_log (kind, tool, query, paths, latency_ms) " +
-                     "VALUES (?,?,?,?,?)")) {
+                     "INSERT INTO " + project + ".rag_query_log (kind, tool, query, paths, latency_ms, source) " +
+                     "VALUES (?,?,?,?,?,?)")) {
             ps.setString(1, kind);
             ps.setString(2, tool);
             ps.setString(3, query);
             ps.setString(4, paths);
             ps.setInt(5, (int) latencyMs);
+            ps.setString(6, currentSource());
             ps.executeUpdate();
         } catch (Exception e) {
             logger.debug("usage logging failed for '" + project + "': " + e.getMessage());

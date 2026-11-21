@@ -51,7 +51,10 @@ are authoritative — update them rather than reinventing.
 | `eval/<project>-queries.jsonl` | Golden query sets (committed) |
 | `src/main/backend/scripts/RAGDefs.groovy` | ctags symbol definitions into `rag_def` — the structural half of the index (`find_symbol`) |
 | `rag_def` / `rag_dep` (per project) | The structural index: ctags definitions, and the import graph. Neither needs an LLM or a rebuild |
-| `eval/turns.py` | Turns-to-answer harness: search_code vs grep, tool calls to answer |
+| `eval/turns.py` | Turns-to-answer harness: search_code vs grep, tool calls to answer (a simulation) |
+| `eval/ab.py` + `eval/<project>-ab-tasks.jsonl` | **Live** A/B: the same task given to a headless Claude Code session with and without the index; counts real tool calls, tokens, correctness. Spends model tokens |
+| `cli/query.py` | The shell query commands (`code-rag search`, `why`, `symbol`, `dependents`). A thin client of the MCP endpoint, so it cannot drift from the MCP tools |
+| `cli/adoption.py` | `code-rag adoption` — index searches vs grep, and whether results were opened, read from Claude Code's session transcripts |
 | `eval/mine.py` | Builds candidate query-set entries from `rag_query_log` (real usage) |
 | `eval/baseline.json`, `eval/results-*.json` | Eval output; `./bld eval` diffs against the baseline |
 | `src/main/precompiled/Tasks.java` | The `bld` build script. Contains `start`, `stop`, `status`, `scan`, port options, server.xml rewriter |
@@ -66,7 +69,7 @@ are authoritative — update them rather than reinventing.
 | `src/main/backend/rag-projects.json` | Live projects list (**gitignored**) |
 | `setup.sh` | First-run setup — copies `.example` → real config + generates random shared secret |
 | `deploy/code-rag.service.example` | systemd **user** service template (start at login, waits for PostgreSQL + Ollama). The server being down is invisible to the agent — it just falls back to Grep — so autostart is the fix for the failure mode that costs the most |
-| `code-rag` | Top-level shell wrapper — `cd $CODE_RAG_HOME && exec ./bld "$@"`. Lets `bld` tasks be invoked from any cwd. Requires only `CODE_RAG_HOME`; everything else is handled by `bld`. Defines one wrapper-only subcommand: `code-rag monitor` runs `watch -n 1 'echo; nvidia-smi; ollama ps'` for a live GPU + Ollama view (Ctrl-C exits). `monitor` is **not** a bld task — it exists only here. |
+| `code-rag` | Top-level shell wrapper — `cd $CODE_RAG_HOME && exec ./bld "$@"`. Lets `bld` tasks be invoked from any cwd. Requires only `CODE_RAG_HOME`; everything else is handled by `bld`. Wrapper-only subcommands (**not** bld tasks — they exist only here): `monitor` (`watch -n 1 'echo; nvidia-smi; ollama ps'`), the four query commands `search` / `why` / `symbol` / `dependents` (→ `cli/query.py`, run from the caller's cwd, which selects the project) and `adoption` (→ `cli/adoption.py`). The query commands bypass bld on purpose: bld starts a JVM, and a search must be as cheap to reach for as grep (~150 ms). `~/bin/code-rag` is a **copy** of this file — re-copy it after editing. |
 
 ## Don't modify (Kiss framework code)
 
@@ -101,7 +104,13 @@ the user can port it upstream rather than carrying a local fork.
 python3 eval/turns.py <queries> <root> <url> <tok> # tool calls to answer: search_code vs grep
 ./bld defs <project|all>                          # extract ctags symbol definitions (find_symbol)
 ./bld deps <project|all>                          # backfill the import graph (find_dependents)
-./bld usage <project|all>                         # is anything actually calling the tool?
+./bld usage <project|all>                         # calls the server received, by tool and by caller (mcp/cli/eval)
+code-rag search "<what the code does>"            # the index from the shell — project = cwd; --all, --project, -k, -n, --json
+code-rag why "<why/when did X change>"            # commit-history search
+code-rag symbol <Name>                            # defined / called from / tests
+code-rag dependents <file> [--deps]               # who imports a file (or what it imports)
+code-rag adoption [days]                          # index searches vs grep, and were results opened (from transcripts)
+python3 eval/ab.py eval/<project>-ab-tasks.jsonl <project>   # live agent A/B, with vs without the index
 ./bld routing-rules                               # rewrite the CLAUDE.local.md routing blocks now
                                                   #   (otherwise they refresh only on 'bld start')
 python3 eval/mine.py <project>                    # candidate query-set entries from real usage
@@ -111,7 +120,7 @@ python3 eval/mine.py <project>                    # candidate query-set entries 
                                                   # add a project, scan it, auto-register MCP entries with Claude Code / Codex
                                                   # --project-dir <dir>: umbrella directory above the roots (NOT indexed);
                                                   #   bld drops a .mcp.json there and a managed CLAUDE.local.md routing snippet
-./bld remove-project <name>                       # drop a project (refuses on last one), auto-deregister MCP entries
+./bld remove-project <name> [<name>...]           # drop project(s) (one must remain), auto-deregister MCP entries; one sweep for the batch
 ./bld add-root <name> <root> [<root>...]          # add roots to an existing project + scan
 ./bld remove-root <name> <root> [<root>...]       # remove roots from a project + scan
 ./bld build                                       # compile precompiled + backend; do not run
@@ -142,13 +151,17 @@ still exists for Codex; tracked as a follow-up).
 **The routing block goes into every root.** `bld start`
 (`writeRoutingRules`), `new-project`, and `add-root` write a
 marker-delimited managed block into `<root>/CLAUDE.local.md` of **every
-configured root**, containing a Grep-vs-`search_code` routing rule (so
-Claude Code prefers `search_code` for conceptual queries rather than
-defaulting to Grep) and an instruction to tell the user when the MCP
-connection is down rather than silently falling back to Grep — with
-manual start/stop, a forgotten `code-rag start` is otherwise invisible.
-The `.mcp.json` alone does not shift Claude Code's tool-selection
-habits; without the block the whole system goes unused in practice.
+configured root**. The block (`Tasks.routingBlockBody`) is built around the
+**shell commands** — `code-rag search|why|symbol|dependents` — not the MCP
+tools, with a "can you NAME it? → grep; otherwise → `code-rag search`" rule,
+a "grep returned >20 files or nothing → stop refining, search" rule of thumb,
+a `dependents`-before-editing rule, and an instruction to tell the user when
+the server is down. It names the MCP tools only as the equivalent route.
+Why shell-first: the transcripts showed agents search through Bash (tens of
+thousands of `grep`/`rg`/`find` commands; the Grep *tool* is never called),
+the MCP schemas were deferred behind a ToolSearch step, and delegated
+searches run in subagents. A command that sits next to grep has none of
+those problems. The `.mcp.json` alone does not shift tool selection.
 Disable with `RAGWriteRoutingRules = false` in `application.ini`.
 `remove-root` and `remove-project` excise the block from departing
 directories unless another configured project still claims them
@@ -197,7 +210,13 @@ every `./bld start` so per-invocation overrides "stick" for that run.
   (history), `rag_def` / `rag_dep` (structural index), `rag_symbol`
   (per-symbol summaries), `rag_query_log` (usage).
 - **Every MCP tool call logs to `rag_query_log`** (`RAGSearch.logUsage`;
-  disable with `RAGLogQueries = false`). Kinds: `search` (search_code,
+  disable with `RAGLogQueries = false`). Each row carries `source`: `mcp`
+  (an agent through the MCP tools), `cli` (the `code-rag` shell commands) or
+  `eval` (a benchmark harness), taken from the `X-RAG-Source` request header.
+  `./bld usage` excludes `eval` rows from every figure — one `turns.py` run
+  once accounted for 122 of 209 logged calls and read as organic use. Any
+  new harness must send `X-RAG-Source: eval` (or set `CODE_RAG_SOURCE=eval`
+  for the CLI). Kinds: `search` (search_code,
   search_history, find_symbol, find_dependents — `paths` holds what came
   back, empty on a miss), `fetch` (get_chunk), `admin` (reindex_path,
   list_repos, index_status). `_all` fan-outs log into each project that
@@ -228,8 +247,8 @@ statements alone:
    changed and silently leave most rows unfilled — until
    `./bld scan <project> --full` clears it.
 
-Current version: **2** (v2 added `rag_chunk.lexemes`, the generated
-`lexemes_tsv`, and its GIN index for hybrid search).
+Current version: **9** (the ladder is listed in the comment above
+`CURRENT_SCHEMA_VERSION`; v9 added `rag_query_log.source`).
 
 `EmbeddingDim` comes from `application.ini` in both `ProjectBootstrap`
 and `RAGIndexer` — do not reintroduce a hardcoded dimension.
@@ -287,7 +306,47 @@ search would give.
 - The secret is generated by `setup.sh` and lives only in the
   gitignored `application.ini`. Never commit it.
 
+## Is it being used? (measure this before tuning retrieval)
+
+Retrieval quality is irrelevant if nothing calls the tool, and for months
+almost nothing did: ~15 real searches against ~40,000 shell searches in the
+same sessions. Three instruments, in order of how much they can be trusted:
+
+- `code-rag adoption [days]` — the only one with a denominator. Reads the
+  client's transcripts: index searches (MCP + CLI) vs grep/rg/find per
+  project, and how many index results were then opened.
+- `./bld usage` — the server's own log; counts what arrived, by tool and
+  caller. It deliberately has **no** "follow-up rate": that used to be
+  `get_chunk` calls per search, but file-granularity results are opened with
+  the client's Read, which the server never sees, so it read 0% regardless.
+- `eval/ab.py` — a live with/without A/B on real tasks. Costs tokens.
+
+The four query tools are marked `_meta["anthropic/alwaysLoad"]` in
+`tools/list` (`RAGMCPServer.markAlwaysLoad`) so Claude Code loads their
+schemas up front instead of deferring them behind ToolSearch. Not applied on
+`_all` (user scope — it would load into every session on the machine).
+Disable with `RAGAlwaysLoadTools = false`.
+
+Index only trees big enough that grep cannot narrow (roughly 400+ files).
+A small repo gains nothing and costs sweep time and a routing block.
+
 ## Common pitfalls (worth knowing before editing)
+
+- **A ctags "name" can be kilobytes long and it used to cost a whole root.**
+  The btree index on `rag_def.name_lower` rejects rows over ~8 KB; the failed
+  INSERT aborted the root's definition pass, so stack360's Backend root had
+  no definitions at all and `find_symbol` silently missed everything in it
+  (visible only as `Backend: FAILED ERROR: index row requires ...` in the
+  sweep log). `RAGDefs.MAX_NAME_LEN` skips such rows. Read the per-root
+  `detail` line of a defs refresh, not just the total.
+- **Do not parse a long JSON string with an alternation regex in `Tasks.java`.**
+  `(?:\\"|[^"])*` recurses once per character in java.util.regex; a
+  reconcile plan listing a few dozen projects overflowed the stack and
+  surfaced only as `error executing task scan`. `extractJsonString` scans by
+  hand.
+- **`scan()` re-parses `commandArgs`.** A task that calls `scan()` after
+  consuming its own positionals must clear `commandArgs` first, or the first
+  leftover argument becomes the scan target.
 
 - **`excludeGlobs` ADDS to the base excludes; it does not replace them.**
   `ProjectRegistry.BASE_EXCLUDES` (build output, VCS/IDE state, minified

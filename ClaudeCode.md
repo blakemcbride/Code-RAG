@@ -272,32 +272,52 @@ match a real project's `name` in `rag-projects.json`. The MCP entry
 name is just Claude Code's local label for that registration. They
 can differ (though conventionally we use the project name for both).
 
-### Managed CLAUDE.md block (when `project_dir` is set)
+### Managed routing block (`CLAUDE.local.md`)
 
-When a project declares `project_dir`, bld additionally writes a
-managed block into `<project_dir>/CLAUDE.md`. Registering the MCP
-server alone isn't enough — Claude Code's tool-selection heuristics
-prefer native Grep/Glob over MCP search tools for code exploration,
-so the `mcp__<project>__search_code` tool often goes unused even
-when available. The CLAUDE.md block ships a routing rule that biases
-the selection: use `search_code` for conceptual queries, Grep for
-literal-token lookups.
+bld writes a managed block into `CLAUDE.local.md` in **every configured
+root** (and in `project_dir` when one is set). Registering the MCP server
+alone is not enough: measured over six weeks, the tools were available in
+hundreds of sessions and called about fifteen times, against roughly forty
+thousand shell searches.
+
+The block therefore routes Claude Code to **shell commands** rather than to
+the MCP tools, because the shell is where it actually searches:
+
+| You know... | Use |
+|---|---|
+| the exact token | `grep` / `rg` |
+| what the code does, not its name | `code-rag search "<plain words>"` |
+| you want why/when it changed | `code-rag why "<question>"` |
+| a symbol; want definition, callers, tests | `code-rag symbol <Name>` |
+| you are about to edit a shared file | `code-rag dependents <file>` |
+
+It also tells the agent to pass the command to subagents it delegates
+searches to, and to tell you when the server is down. The MCP tools are
+named as the equivalent route.
+
+`code-rag` must be on `PATH` with `CODE_RAG_HOME` set for the agent's shell
+(if it is not on `PATH`, the block is written with the absolute path).
 
 The block is delimited by HTML-comment markers
 (`<!-- BEGIN code-rag managed block ... -->` / `<!-- END ... -->`).
-Everything between them is bld-managed and will be rewritten on the
-next `bld start` / `bld new-project` / `bld add-root`. Everything
-outside the markers is left untouched — bld appends the block to an
-existing CLAUDE.md, or creates the file if none exists.
+Everything between them is rewritten on `bld start`, `bld routing-rules`,
+`new-project` and `add-root`; everything outside is left untouched. It goes
+in `CLAUDE.local.md`, never `CLAUDE.md`, because it describes this machine's
+local index, not the repository. `remove-project` / `remove-root` excise it.
+Set `RAGWriteRoutingRules = false` in `application.ini` to stop bld writing
+it.
 
-`bld remove-project` excises the block on the way out. If the
-resulting file is empty, bld deletes it; otherwise the surrounding
-content is preserved.
+### Tools load up front, not deferred
 
-If you decide you don't want the routing rule, removing
-`project_dir` from `rag-projects.json` stops bld from re-asserting
-the block — but the existing block stays put until you delete it
-by hand (or run `remove-project` + `new-project`).
+Claude Code normally defers MCP tools: only their names are listed and the
+model must run a tool search to load a schema before calling one. The server
+marks the four query tools (`search_code`, `search_history`, `find_symbol`,
+`find_dependents`) with `_meta["anthropic/alwaysLoad"]`, which opts them out
+of deferral, so they are callable immediately. The admin tools stay
+deferred, and the cross-project `code_rag_all` entry is not marked (it is
+user-scope and would load into every session). Set
+`RAGAlwaysLoadTools = false` in `application.ini` to turn this off. The
+same effect is available per entry with `"alwaysLoad": true` in `.mcp.json`.
 
 ## 6. Operations and triggering scans
 

@@ -130,6 +130,9 @@ public class RAGMCPServer extends MCPServerBase {
         // Tomcat's pooled thread.
         String style = request.getHeader("X-Path-Style");
         CURRENT_PATH_STYLE.set(style == null ? null : style.toLowerCase());
+        // Caller kind (mcp / cli / eval) for the usage log. Also set
+        // unconditionally, for the same pooled-thread reason.
+        RAGSearch.setSource(request.getHeader("X-RAG-Source"));
         return true;
     }
 
@@ -154,8 +157,8 @@ public class RAGMCPServer extends MCPServerBase {
                 "on this project — it does similarity search over the indexed tree and surfaces " +
                 "related code that grep misses because the matching files do not contain the " +
                 "keyword. Returns top-K chunks (file path, line range, symbol, score, snippet). " +
-                "Prefer this over Grep/Glob whenever you do not already know an exact token to " +
-                "search for. By default it returns ranked FILES — each with the symbols that matched " +
+                "Prefer this over grep (in the shell or as the Grep/Glob tools) whenever you do " +
+                "not already know an exact token to search for. By default it returns ranked FILES — each with the symbols that matched " +
                 "and the best excerpt already expanded to the whole enclosing function — so one call " +
                 "usually answers the question; Read the absolute_path + line range only when you need " +
                 "more surrounding context. It also covers every repository configured for this " +
@@ -315,7 +318,45 @@ public class RAGMCPServer extends MCPServerBase {
                 new String[]{}, new String[]{}, new String[]{}));
         tools.put(status);
 
+        markAlwaysLoad(tools);
         return tools;
+    }
+
+    /** The query-shaped tools — the ones an agent should reach for unprompted. */
+    private static final java.util.Set<String> ALWAYS_LOAD_TOOLS = new java.util.HashSet<>(
+            java.util.Arrays.asList("search_code", "search_history", "find_symbol", "find_dependents"));
+
+    /**
+     * Ask the client to load the query tools up front instead of deferring
+     * them behind a tool-search step.
+     *
+     * A client that defers MCP tools lists only their names; the model must
+     * run a search to load a schema before it can call one. That is one extra
+     * step in front of a tool whose whole pitch is saving a step, and the
+     * usage log showed the result: the tools were present in hundreds of
+     * sessions and called in almost none. The {@code anthropic/alwaysLoad}
+     * tool annotation opts a tool out of deferral; clients that do not know
+     * it ignore it.
+     *
+     * Not applied on the cross-project endpoint: that one is registered at
+     * user scope, so its tools would be loaded into every session on the
+     * machine, including ones in unindexed directories. Disable entirely
+     * with {@code RAGAlwaysLoadTools = false}.
+     */
+    private static void markAlwaysLoad(JSONArray tools) {
+        if (isAllProjects())
+            return;
+        final Object flag = MainServlet.getEnvironment("RAGAlwaysLoadTools");
+        if (flag != null && "false".equalsIgnoreCase(flag.toString().trim()))
+            return;
+        for (int i = 0; i < tools.length(); i++) {
+            final JSONObject t = tools.getJSONObject(i);
+            if (!ALWAYS_LOAD_TOOLS.contains(t.getString("name", "")))
+                continue;
+            final JSONObject meta = new JSONObject();
+            meta.put("anthropic/alwaysLoad", true);
+            t.put("_meta", meta);
+        }
     }
 
     @Override
